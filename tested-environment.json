@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "platform": "win32",
+  "architecture": "x64",
+  "runtime": "source-web",
+  "node": "24.15.0",
+  "pnpm": "11.28.5",
+  "core": {
+    "repository": "vb2250158/deepseek-harness",
+    "commit": "54931fbd25050ef036e44b1daec931da2bfe7b39",
+    "version": "0.2.2-rc.1"
+  },
+  "installation": "Fixed Git commit with prepare, using the source Host's dependencies",
+  "adoption": "Candidate validation; formal adoption is recorded by the environment owner"
+}

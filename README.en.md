@@ -4,6 +4,10 @@
 
 <h1 align="center">dsh-connect-workbuddy</h1>
 
+## Maintained fork environment
+
+This fork targets Windows x64, Node 24.15.0, pnpm 11.28.5 and the source Web Host at Core commit `54931fbd25050ef036e44b1daec931da2bfe7b39` (0.2.2-rc.1). See [tested-environment.json](tested-environment.json). In an isolated development checkout, set `DSH_HARNESS` to that installed and built Core, run `node scripts/prepare-tested-host.mjs`, then `pnpm install --no-frozen-lockfile` before the existing checks. Environment maintenance records formal adoption separately. Reports and pull requests for other environments are reviewed from concrete reproductions.
+
 <p align="center"><b>Connect locally signed-in WorkBuddy models — CN and international — to DeepSeek Harness: read each model's credit multiplier automatically, toggle image input per model, switch between multiple accounts, and keep daily check-in with a read-only credits overview in capsule readouts on the card and in the composer.</b></p>
 
 <p align="center">
@@ -325,7 +329,7 @@ Details (how the market index and the pnpm window each stop you, and both ways t
 
 ## Platform support
 
-All three platforms are supported targets; the differences below are **implementation facts**, not polite ways of saying "not yet supported". To change this section, change [`docs/WINDOWS.md`](docs/WINDOWS.md) too — that file is where platform-related constraints are registered.
+This maintained fork tests the Windows source Web environment declared in [tested-environment.json](tested-environment.json). The table retains upstream implementation details for each platform. Reports for other environments are reviewed from concrete reproductions. Platform constraints are registered in [`docs/WINDOWS.md`](docs/WINDOWS.md).
 
 | Aspect | Windows | macOS | Linux |
 | --- | --- | --- | --- |
@@ -335,7 +339,7 @@ All three platforms are supported targets; the differences below are **implement
 | Child-process window | **`windowsHide` is required**: the host itself has no console (it is a GUI process), so without it every probe flashes a visible black window on screen | Not applicable (the option only takes effect on Windows) | Not applicable |
 | Transient settings-file contention | **Does hit it**: an antivirus scanner / OneDrive / an editor locking the profile's `cordis.patch.yml` briefly makes the rename replace fail, and `@deepseek-ai/dsh-atomic-write`'s retries are enabled **only on `win32`** | Does not: POSIX rename replaces outright, so the same code never enters the retry branch | Same as macOS |
 | Credential vault file permissions | **`mode: 0o600` has no effect**, because permissions come from the inherited DACL → the plugin hardens the directory and file with `icacls` around each write (owner / SYSTEM / Administrators only). `doctor` reads it back and reports `protected` / `exposed` / `unverified` | Enforced by `mode 0600` | Enforced by `mode 0600` |
-| CI coverage | `windows-latest`, full suite | The developer's own Mac | `ubuntu-latest`, full suite |
+| This fork's CI coverage | `windows-2025`, fixed current source Host | Concrete community reports | Concrete community reports |
 
 **Four Windows-specific things worth knowing**:
 

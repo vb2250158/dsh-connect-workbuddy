@@ -38,6 +38,7 @@
     "@deepseek-ai/schemastery": "3.19.0"
   },
   "files": [
+    "tested-environment.json",
     "lib",
     "native",
     "icons",

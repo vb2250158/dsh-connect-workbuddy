@@ -26,6 +26,10 @@
 
 一个独立的 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) bundle 插件。它把本机已登录的 WorkBuddy 账号（**国内版与国际版 WorkBuddy AI 均支持**）接到 DSH 的模型选择器，同时提供账号池、可勾选的模型管理，以及一套围绕积分的只读能力：**每次刷新按上游目录自动读取每个模型的积分倍率**（`x0.79` 这种，倍率完全由上游给出，插件不写死也不猜）、逐模型开关图片输入、多账号切换与账号池自动换号、每日签到、以及卡片与输入框里胶囊式的只读积分读数。**国内版与国际版是两个并行的供应商（`workbuddy` / `workbuddy-global`），可同时使用**；插件设置页以 tab 区分两者，方便统一管理。只需本机 WorkBuddy 的登录态，**或在浏览器里登录一次**即可。
 
+### 维护 fork 的受测环境
+
+本 fork 使用 Windows x64、Node 24.15.0、pnpm 11.28.5，宿主为 Core 源码 `54931fbd25050ef036e44b1daec931da2bfe7b39`（0.2.2-rc.1）的 Web 入口。固定版本见 [tested-environment.json](tested-environment.json)。在独立开发副本中设置 `DSH_HARNESS` 指向已安装并构建的该源码，再运行 `node scripts/prepare-tested-host.mjs` 和 `pnpm install --no-frozen-lockfile`，可让现有检查使用当前宿主依赖。采用状态由环境维护记录单独确认。社区其它环境的具体问题和 PR 按实际复现评审。
+
 ### 图标样式
 
 在设置页的「能力」tab 最下方选择图标样式。默认是本插件自己的图标；另一个皮肤跟随主题的文字颜色。选择会立即应用到侧边栏、页头和面板，并保存在当前浏览器中；其他浏览器需要单独设置。
@@ -414,7 +418,7 @@ dsh plugin --profile desktop exec dsh-connect-workbuddy doctor   # 第一行就�
 
 ## 平台支持
 
-三个平台都是受支持目标；下列差异是**实现事实**，不是「尚未支持」的委婉说法。要改这一节，请同时改 [`docs/WINDOWS.md`](docs/WINDOWS.md)——那份文件是平台相关约束的登记处。
+本维护 fork 的受测目标是 [tested-environment.json](tested-environment.json) 声明的 Windows 源码 Web 环境。下表保留上游各平台的实现说明，其他环境的具体反馈按复现情况评审。平台约束登记在 [`docs/WINDOWS.md`](docs/WINDOWS.md)。
 
 | 方面 | Windows | macOS | Linux |
 | --- | --- | --- | --- |
@@ -424,7 +428,7 @@ dsh plugin --profile desktop exec dsh-connect-workbuddy doctor   # 第一行就�
 | 子进程的窗口 | **必须 `windowsHide`**：宿主本身没有控制台（GUI 进程），漏设会让每次探测都在屏幕上闪一个可见的黑框 | 不适用（该选项仅 Windows 生效） | 不适用 |
 | 设置写入的瞬时占用 | **会踩到**：profile 的配置文件 `cordis.patch.yml` 被杀毒软件 / OneDrive / 编辑器短暂锁定会拒绝 rename 覆盖，`@deepseek-ai/dsh-atomic-write` 的重试**只在 `win32` 生效** | 不踩：POSIX 的 rename 直接替换，同一段代码不进重试分支 | 同 macOS |
 | 凭据库（vault）的文件权限 | **`mode: 0o600` 不生效**，权限由继承的 DACL 决定 → 写入前后用 `icacls` 显式加固（只允许 所有者 / SYSTEM / Administrators）。`doctor` 会回读并报告 `protected` / `exposed` / `unverified` | 由 `mode 0600` 生效 | 由 `mode 0600` 生效 |
-| CI 覆盖 | `windows-latest` 跑完整套件 | 开发者本机（macOS） | `ubuntu-latest` 跑完整套件 |
+| 本 fork CI 覆盖 | `windows-2025`，固定当前源码宿主 | 按社区具体反馈评审 | 按社区具体反馈评审 |
 
 **Windows 上需要知道的四个具体点**：
 

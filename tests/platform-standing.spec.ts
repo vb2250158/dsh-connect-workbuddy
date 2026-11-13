@@ -6,14 +6,14 @@ import { describe, expect, it } from 'vitest'
  * Guard the project's platform standing: Windows is a first-class target.
  *
  * This is a POLICY test, not a behaviour test. It does not prove the Windows
- * code paths work — CI on `windows-latest` and the pinned unit tests do that.
- * It proves the *standing* cannot silently decay: the CI matrix keeps a
- * Windows runner, the platform register keeps existing, and the READMEs keep
+ * code paths work — the declared Windows runner and behavior tests do that.
+ * It proves the standing cannot silently decay: CI keeps the current source
+ * Host on Windows, the platform register keeps existing, and the READMEs keep
  * telling users Windows is supported, with the three files staying in step.
  *
  * Why this is worth a test rather than a convention: every element here is a
  * one-line deletion away from gone, and none of them fails loudly. Dropping
- * `windows-latest` from the matrix would leave CI green; deleting the register
+ * the Windows source Host from CI would leave unrelated tests green; deleting the register
  * would break no build; a README losing its Platform-support section would
  * still render. The decay is invisible until a Windows user is affected — and
  * by then the regression is old. A failing assertion is cheaper than that.
@@ -31,13 +31,17 @@ function read(relativePath: string): string {
 }
 
 describe('platform standing', () => {
-  it('keeps a Windows runner in the CI matrix', () => {
+  it('keeps the declared Windows source Host in the single CI target', () => {
     const ci = read('.github/workflows/ci.yml')
-    // A matrix that lost its Windows entry still passes everything else, so
-    // this is the only thing that would notice.
-    expect(ci).toContain('windows-latest')
-    expect(ci).toContain('ubuntu-latest')
-    expect(ci).toMatch(/os:\s*\[[^\]]*windows-latest/)
+    const environment = JSON.parse(read('tested-environment.json'))
+    expect(environment.platform).toBe('win32')
+    expect(environment.architecture).toBe('x64')
+    expect(ci).toContain('runs-on: windows-2025')
+    expect(ci).not.toMatch(/\bmatrix:/)
+    expect(ci).toContain(`ref: ${environment.core.commit}`)
+    expect(ci).toContain(`node-version: ${environment.node}`)
+    expect(ci).toContain(`version: ${environment.pnpm}`)
+    expect(ci).toContain('node scripts/prepare-tested-host.mjs')
   })
 
   it('keeps the platform register', () => {

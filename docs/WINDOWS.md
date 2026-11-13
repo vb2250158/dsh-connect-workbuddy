@@ -1,5 +1,7 @@
 # Windows 支持登记与约束（Windows Support Register）
 
+本维护 fork 的当前受测环境见 [tested-environment.json](../tested-environment.json)。默认 CI 使用固定 Windows 源码宿主。以下登记保留上游平台约束和历史证据。当前测试将账号目录、Program Files 和显式程序路径一起隔离，防止密钥发现测试启动开发机已安装的 WorkBuddy。
+
 > 本文件是 `dsh-connect-workbuddy` **平台相关约束的登记处**。README 的「平台支持」一节是面向使用者的摘要，本文件是面向维护者的完整登记。
 >
 > **维护约定：任何改动 Windows 行为的提交，必须同时更新本文件；README 的「平台支持」表若随之变化，两份 README（`README.md` / `README.en.md`）必须一起改，且与本文件保持一致。** 这是本项目的长期口径：**Windows 是一等目标平台，每次改动的默认考量面包含 Windows。**
