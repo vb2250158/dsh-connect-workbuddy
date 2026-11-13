@@ -4,6 +4,8 @@
 
 <h1 align="center">dsh-connect-workbuddy</h1>
 
+Host heartbeat cleanup belongs to the plugin instance that successfully wrote it. Manual callers retain the result of `await writeHostHeartbeat()` and pass it to `clearHostHeartbeat(owner)`. An unwritten startup or a superseded registration preserves the current Host receipt.
+
 ## Maintained fork environment
 
 This fork targets Windows x64, Node 24.15.0, pnpm 11.28.5 and the source Web Host at Core commit `54931fbd25050ef036e44b1daec931da2bfe7b39` (0.2.2-rc.1). See [tested-environment.json](tested-environment.json). In an isolated development checkout, set `DSH_HARNESS` to that installed and built Core, run `node scripts/prepare-tested-host.mjs`, then `pnpm install --no-frozen-lockfile` before the existing checks. Environment maintenance records formal adoption separately. Reports and pull requests for other environments are reviewed from concrete reproductions.
