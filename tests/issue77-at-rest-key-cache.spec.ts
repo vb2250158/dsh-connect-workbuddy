@@ -177,11 +177,32 @@ describe('issue #77: the at-rest key lookup is not repeated per file', () => {
     // No desktop app anywhere: the discovery falls through to the registry,
     // which has nothing to match. This is the reported machine's state.
     const first = await readAtRestKey()
-    // A host WITH the desktop app installed may legitimately return a key;
-    // then there is no failure to cache and the call-count assertions below
-    // would be measuring the host, not the fix. The negative-cache test needs
-    // a machine that cannot produce one, and CI's is that machine.
-    if (first !== undefined) return
+    // THE PRECONDITION, ASSERTED RATHER THAN ASSUMED.
+    //
+    // This used to be `if (first !== undefined) return` — a silent early exit
+    // for a host that has WorkBuddy installed. It read as "not applicable
+    // here", but the reporter shows up as a PASS, so a machine where the
+    // precondition failed reported success while running NONE of the
+    // assertions below. That is how a test stops being evidence without
+    // anybody noticing.
+    //
+    // It is now a real assertion: `vitest.config.ts`'s `isolatedEnv` pins
+    // `ProgramFiles` / `ProgramFiles(x86)` / `WORKBUDDY_APP_EXECUTABLE` into
+    // the synthetic home, so every exact-path candidate the win32 branch
+    // generates points at a directory that cannot exist, and the mocked `reg`
+    // below throws for every query. A REAL key here therefore means one of
+    // those seams broke, and the test says so instead of quietly skipping.
+    //
+    // WHAT THIS DOES **NOT** PROVE, measured rather than assumed: CI cannot
+    // show that the isolation is what makes it pass. GitHub's `windows-latest`
+    // image has no WorkBuddy installed (`C:\Program Files` is real there, but
+    // none of the probed subdirectories exist), so the exact-path candidates
+    // miss with or without the pin — deleting those five lines leaves this
+    // suite green. The pin's value is that a DEVELOPER machine which does have
+    // the app now reports a failure instead of a false pass; on CI the two
+    // configurations are indistinguishable. Anyone re-checking this should
+    // verify it on a machine with WorkBuddy installed, not on a runner.
+    expect(first, 'the at-rest key lookup must find nothing under the isolated env').toBeUndefined()
     const afterFirst = registryCalls.length
     // One discovery = one pass over the three uninstall hives, and no more.
     expect(afterFirst).toBe(3)
