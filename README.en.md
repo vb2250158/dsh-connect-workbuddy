@@ -10,6 +10,8 @@ Host heartbeat cleanup belongs to the plugin instance that successfully wrote it
 
 This fork targets Windows x64, Node 24.15.0, pnpm 11.28.5 and the source Web Host at Core commit `54931fbd25050ef036e44b1daec931da2bfe7b39` (0.2.2-rc.1). See [tested-environment.json](tested-environment.json). In an isolated development checkout, set `DSH_HARNESS` to that installed and built Core, run `node scripts/prepare-tested-host.mjs`, then `pnpm install --no-frozen-lockfile` before the existing checks. Environment maintenance records formal adoption separately. Reports and pull requests for other environments are reviewed from concrete reproductions.
 
+The upstream rc.3 development-line review remains an upstream record. This fork continues to prepare dependencies from its declared source Host; a future Host adoption is verified by the environment owner before the tested environment is updated.
+
 <p align="center"><b>Connect locally signed-in WorkBuddy models — CN and international — to DeepSeek Harness: read each model's credit multiplier automatically, toggle image input per model, switch between multiple accounts, and keep daily check-in with a read-only credits overview in capsule readouts on the card and in the composer.</b></p>
 
 <p align="center">
@@ -232,9 +234,9 @@ DSH's shipped gate (`evaluatePluginCompatibility` in `packages/boot/app-boot/src
 | `0.3.0-0` and above | ❌ explicitly refused (that line is unverified) |
 | `0.1.6` and earlier | ❌ explicitly refused (0.1.5 users should stay on v2.0.15) |
 
-> **`0.2.2-rc.1` / `0.2.2-rc.2` are verified working** (5.23.0): both hosts' shipped gates evaluate the declared range as
-> ADMITTED, the plugin loads completely on a running host (16 routes, 6 of 8 slots, all client modules registered), and this
-> repository's suite is green on the real `0.2.2-rc.2` + pi-ai `1.3.0` combination. The "⚠️ outside the declared range" row
+> **`0.2.2-rc.1` / `0.2.2-rc.2` / `0.2.2-rc.3` are verified working** (5.24.0): all three hosts' shipped gates evaluate the declared
+> range as ADMITTED, the plugin loads completely on a running host (16 routes, 6 of 8 slots, all client modules registered), and this
+> repository's suite is green on the real `0.2.2-rc.3` + pi-ai `1.3.0` combination. The "⚠️ outside the declared range" row
 > above still describes **bare semver** evaluation, which is a different question from "does it run" — see the next note.
 
 > **On `0.2.x` prereleases (corrected in v4.7.0)**: this table previously listed `0.2.0-rc.1` as "✅ supported". That was **wrong**.
