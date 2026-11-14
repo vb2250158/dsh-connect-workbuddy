@@ -12,6 +12,8 @@ This fork targets Windows x64, Node 24.15.0, pnpm 11.28.5 and the source Web Hos
 
 The upstream rc.3 development-line review remains an upstream record. This fork continues to prepare dependencies from its declared source Host; a future Host adoption is verified by the environment owner before the tested environment is updated.
 
+Outgoing tool parameters normalize legacy JSON Schema forms refused by upstream. An explicit tuple `additionalItems` boolean or schema moves to `items`, preserving the caller's tail constraint. An unspecified tail remains open. Internal references remain intact, and error 11129 guidance identifies the tool-definition diagnosis entry.
+
 <p align="center"><b>Connect locally signed-in WorkBuddy models — CN and international — to DeepSeek Harness: read each model's credit multiplier automatically, toggle image input per model, switch between multiple accounts, and keep daily check-in with a read-only credits overview in capsule readouts on the card and in the composer.</b></p>
 
 <p align="center">
@@ -587,6 +589,32 @@ node scripts/verify-entry-artifacts.mjs <installed dir>    # a specific installe
 
 > Installing from npm (`dsh plugin add dsh-connect-workbuddy`) needs none of this: the published
 > tarball already contains `lib/`, and `prepack` only regenerates it.
+
+### Host heartbeat: cleanup belongs to the instance that **wrote** it
+
+`writeHostHeartbeat()` writes a Host receipt to `$DSH_HOME/.workbuddy-host-heartbeat.json`, and `doctor` reads it to decide whether a Host is alive. Disposal no longer deletes that file unconditionally — it removes only the exact write it made.
+
+Three real failures all came from "anyone may delete it":
+
+- **A failed startup still cleaned up.** Registration threw, so there was no receipt of its own to remove — what it deleted belonged to **another Host still running**.
+- **Two Hosts write the same file.** The newer one exits first; the older instance's cleanup removed its receipt and `doctor` then reported "host not running".
+- **The write is asynchronous.** A disposal that finished before the write landed deleted nothing, and the stale record reappeared a moment later.
+
+So:
+
+```ts
+const owner = await writeHostHeartbeat()   // returns { path, contents }
+// …while the plugin is alive…
+await clearHostHeartbeat(owner)            // removes only this one; no-op if absent, replaced, or undefined
+```
+
+- The path is captured **at write time**, so a later `DSH_HOME` change cannot redirect cleanup into another directory.
+- If the bytes no longer match (another instance overwrote the file), the **current file is kept** — that is the whole of "a new Host is not deleted by an old instance".
+- Of the read failures only `ENOENT` is treated as normal; everything else rejects to the caller.
+- Each write carries a `registrationId` (a UUID) that distinguishes two registrations landing in the same millisecond under the same PID. It is **write-only**: `readHostHeartbeat()`'s v2 fields and its version rule are unchanged.
+- The real disposer awaits a pending write before cleaning up; a failed write is logged once as an error and the instance then exits owning nothing.
+
+**Known limit: cross-process atomic exclusion is not implemented.** A narrow window remains between read, compare and unlink, in which an external process could replace the file. What this change guarantees is **instance ownership**, not mutual exclusion; closing that window needs a separate cross-process lock design and is out of scope here.
 
 ### Calling `chatStream()` from a script: it returns an **envelope**, not a stream
 
