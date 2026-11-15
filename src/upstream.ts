@@ -1080,10 +1080,18 @@ export function isToolSchemaRejectBody(body: string): boolean {
  * Deliberately a FIXED LIST rather than a parse of the offending body: the
  * upstream never names the keyword, and the plugin has already rewritten every
  * one of these on the way out. If a request still gets `11129` after that
- * rewrite, the cause is a keyword this build does not know — so the advice has to
- * say "something else", not repeat the four shapes it already handled.
+ * rewrite, the cause is a keyword this build does not know — so the advice has
+ * to say "something else", not repeat the shapes it already handled.
+ *
+ * KEPT IN STEP WITH THE REWRITE, by hand. It listed only the four draft-4
+ * shapes for a while AFTER the type repair had landed, so a reader who hit a
+ * surviving `11129` was told the plugin had tried four things when it had tried
+ * the whole class — the exact "confident, wrong, and unhelpful" reply that this
+ * function exists to replace. When `normalizeMetaSchemaTypes` learns a new
+ * family, this string has to learn it too.
  */
 const TOOL_SCHEMA_REWRITTEN_KEYWORDS = '元组式 `items`、布尔 `exclusiveMinimum`/`exclusiveMaximum`、`required` 非数组或含重复项、外部 `$ref`'
+  + '，以及关键字的值类型写错（如 `title: 1`、`minimum: "0"`、`allOf: {}`、`type: []`、`enum`/`examples` 写成标量）'
 
 /**
  * One actionable sentence for a `11129` refusal, naming what was already fixed
@@ -1116,6 +1124,69 @@ export function toolSchemaRejectAdvice(): string {
  * its comments avoiding.
  */
 export const CONTEXT_OVERFLOW_MARKER = 'prompt is too long (upstream code 11115)'
+
+/**
+ * The marker for a request refused because its BODY BYTES exceed a local limit
+ * (issue #258).
+ *
+ * Deliberately the SAME English head pi-ai's `OVERFLOW_PATTERNS` already
+ * matches (`prompt is too long`), with a parenthetical naming the real cause.
+ * The host's rescue ladder keys on that phrase and on nothing else, so a
+ * refusal it must recover from has to carry it — see the #101 comment in
+ * `src/shim.ts` for how the 11115 case arrived at the same shape.
+ *
+ * The parenthetical is NOT the bili code. Naming another plugin's identifier
+ * here would be plugin-specific code in this plugin's body — the line
+ * `docs/DESIGN.md` §零 draws — and the code would keep describing a dependency
+ * that may be gone tomorrow. What this string states is the fact that matters:
+ * the request was too large to send.
+ */
+export const BODY_OVERSIZE_MARKER = 'prompt is too long (request body exceeded the local byte limit)'
+
+/**
+ * Whether this text reports a body-size refusal rather than a token overflow
+ * (issue #258).
+ *
+ * A local proxy/gateway in front of the provider may refuse a request whose
+ * serialized body exceeds some byte ceiling it enforces. Measured shapes, from
+ * a real report:
+ *
+ *   bili_gate_oversize_refusal_unattributed_bytes
+ *   (8,401,132 B > 8,388,608 B)
+ *   "unattributed oversized model request refused locally with a 422"
+ *
+ * MATCHED BY MEANING, NOT BY NAME. That is the crux of the design decision
+ * here: matching a plugin's identifier would be the "special-case another
+ * plugin" this project forbids, while matching "a request body was too large"
+ * is the same kind of reader as every other measured-wording matcher in this
+ * module. A refusal that only says `oversize`/`too large` in BYTES is the class;
+ * which component produced it is not this plugin's business, and a future
+ * component with different wording that still says so is covered for free.
+ *
+ * What is deliberately NOT matched: `too_many_tokens`, `context length
+ * exceeded`, `11115` and friends. Those are TOKEN overflow, which the host
+ * already recovers from on its own; treating them here would make two
+ * authorities compete over the same failure.
+ */
+export function isBodyOversizeRefusal(text: string): boolean {
+  if (text === '') return false
+  const lower = text.toLowerCase()
+  // The byte-comparison shape ("8,401,132 B > 8,388,608 B") is the most
+  // specific evidence, and the one every measured refusal carried.
+  if (/[\d,]{4,}\s*b\s*>\s*[\d,]{4,}\s*b/u.test(lower)) return true
+  // "request-body limit" names a BYTE ceiling by construction — a token limit is
+  // never described that way — so it stands on its own.
+  if (lower.includes('request-body limit') || lower.includes('request body limit')) return true
+  const oversize = lower.includes('oversize')
+  const localByte = lower.includes('byte limit')
+  const localRefusal = lower.includes('refused locally')
+  // "byte limit" IS a byte ceiling, stated plainly — it needs no second word.
+  if (localByte) return true
+  // `oversize` alone is too weak: an upstream can say "oversized" about an
+  // IMAGE, and folding history would not fix that. It has to be paired with an
+  // explicit "refused locally" that names a body.
+  return oversize && localRefusal
+}
 
 /**
  * Wording that identifies the CHANNEL half of `11128` (the other halves being
@@ -3751,11 +3822,18 @@ function normalizeSchemaNode(node: unknown, depth = 0): void {
   if (depth > MAX_SCHEMA_DEPTH) return
   const schema = node as Record<string, unknown>
 
+  // ORDER MATTERS. The draft-4 conversions run FIRST, because several of them
+  // consume values that the type repair below would otherwise delete for having
+  // the "wrong" type: a boolean `exclusiveMinimum` and a tuple `items` are both
+  // legal draft-4 spellings that must be TRANSLATED, not dropped. Running the
+  // repair first turned `items: []` into "no items at all" and silently lost the
+  // tuple tail — caught by the round-trip tests.
   normalizeItems(schema)
   normalizeExclusiveBound(schema, 'exclusiveMinimum', 'minimum')
   normalizeExclusiveBound(schema, 'exclusiveMaximum', 'maximum')
   normalizeRequired(schema)
   dropExternalRef(schema)
+  normalizeMetaSchemaTypes(schema)
 
   for (const key of SCHEMA_CHILD_MAPS) {
     const child = schema[key]
@@ -3769,6 +3847,11 @@ function normalizeSchemaNode(node: unknown, depth = 0): void {
   }
   // `additionalProperties` / `items` (when an object) / `not` / `contains` take a
   // single schema, so they are walked directly rather than through a map.
+  for (const key of SCHEMA_CHILD_DEPENDENCIES) {
+    const child = schema[key]
+    if (typeof child !== 'object' || child === null || Array.isArray(child)) continue
+    for (const nested of Object.values(child as Record<string, unknown>)) normalizeSchemaNode(nested, depth + 1)
+  }
   for (const key of SCHEMA_CHILD_SINGLE) normalizeSchemaNode(schema[key], depth + 1)
 }
 
@@ -3788,15 +3871,176 @@ const SCHEMA_CHILD_MAPS: readonly string[] = ['properties', 'patternProperties',
 const SCHEMA_CHILD_LISTS: readonly string[] = ['allOf', 'anyOf', 'oneOf', 'prefixItems']
 
 /** Keywords whose value is a SINGLE schema (walked directly). */
-const SCHEMA_CHILD_SINGLE: readonly string[] = ['items', 'additionalProperties', 'not', 'contains', 'if', 'then', 'else', 'propertyNames']
+const SCHEMA_CHILD_SINGLE: readonly string[] = ['items', 'additionalItems', 'additionalProperties', 'not', 'contains', 'if', 'then', 'else', 'propertyNames']
+
+/**
+ * Keywords whose value is a MAP whose values may be schemas, where only SOME of
+ * those values are schemas at all (issue #253, second report).
+ *
+ * `dependencies` is draft-4's spelling of two different 2020-12 keywords: an
+ * ARRAY value is `dependentRequired`, an OBJECT value is `dependentSchemas`.
+ * Its object values are therefore descended into like `dependentSchemas`, so a
+ * draft-4 leftover nested inside one is still rewritten.
+ *
+ * Measured raw: `dependencies` itself is ACCEPTED by the upstream, so nothing
+ * here is a refusal fix — it is traversal, so that the rewrites this module owns
+ * reach inside the keyword instead of stopping at it.
+ */
+const SCHEMA_CHILD_DEPENDENCIES: readonly string[] = ['dependencies']
+
+/**
+ * Repair keyword values whose TYPE the upstream will not take (issue #253).
+ *
+ * THE SECOND REPORT ON #253 WAS A DIFFERENT BUG. The first round migrated
+ * draft-4 SPELLINGS (tuple `items`, boolean exclusive bounds, string `required`,
+ * external `$ref`). The reporter then supplied three more draft-4 spellings
+ * (`type` arrays, `dependencies`, `additionalItems`) and a patch — but all three
+ * were measured ACCEPTED, raw, on `deepseek-v4.1-flash`, so migrating them fixes
+ * nothing. What was actually rejected, measured one keyword at a time against a
+ * raw body, is a class of TYPE errors in the definition itself: 36 of them, in
+ * every position. `title: 1`, `minimum: "0"`, `examples: "x"`, `pattern: 123`,
+ * `allOf: {}`, `additionalProperties: "x"`, `uniqueItems: "true"` — each answers
+ * `11129`, and each answers 200 once the value has the type the keyword takes.
+ *
+ * WHY REPAIR RATHER THAN REPORT. The upstream's own sentence names no keyword
+ * and no tool, and the definition often comes from a third-party bundle or MCP
+ * server the user did not write. Dropping the offending value is what keeps the
+ * tool USABLE: every keyword here is an annotation or a constraint, never
+ * structure — no `properties` map, no `required` list, no schema-valued keyword
+ * is touched — so removing a malformed one cannot change which arguments the
+ * tool accepts. It only stops the definition from being refused outright.
+ *
+ * THE ALTERNATIVE WAS CONSIDERED AND REJECTED: dropping the whole TOOL. It is
+ * simpler, but it silently removes a capability the user installed, and the
+ * model then invents calls to a tool that no longer exists.
+ *
+ * Only values that are WRONG are touched. A schema already carrying correct
+ * types leaves this function byte-identical, which keeps the prompt prefix
+ * stable for caching.
+ */
+function normalizeMetaSchemaTypes(schema: Record<string, unknown>): void {
+  // A STRING keyword given a non-string is dropped. `id` is deliberately absent:
+  // measured accepted as a number, and it is not 2020-12's spelling anyway.
+  for (const key of SCHEMA_STRING_KEYWORDS) {
+    const value = schema[key]
+    if (value !== undefined && typeof value !== 'string') delete schema[key]
+  }
+  // A NUMBER keyword given a non-number is dropped. Booleans are excluded too:
+  // `minimum: true` is as wrong as `minimum: "0"`.
+  for (const key of SCHEMA_NUMBER_KEYWORDS) {
+    const value = schema[key]
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value))) delete schema[key]
+  }
+  // A BOOLEAN keyword given a non-boolean is dropped.
+  for (const key of SCHEMA_BOOLEAN_KEYWORDS) {
+    const value = schema[key]
+    if (value !== undefined && typeof value !== 'boolean') delete schema[key]
+  }
+  // A LIST keyword given a non-array, or an EMPTY array, is dropped.
+  //
+  // The empty case is measured, not defensive: `allOf: []`, `anyOf: []`,
+  // `oneOf: []` and `prefixItems: []` are each refused, while an absent keyword
+  // means exactly what an empty one was trying to say ("no constraint").
+  for (const key of SCHEMA_LIST_KEYWORDS) {
+    const value = schema[key]
+    if (value === undefined) continue
+    if (!Array.isArray(value) || value.length === 0) delete schema[key]
+  }
+  // A list of STRINGS given a non-array is dropped; an empty one is legal
+  // (`required: []` is accepted) so it is left alone.
+  for (const key of SCHEMA_STRING_LIST_KEYWORDS) {
+    const value = schema[key]
+    if (value !== undefined && !Array.isArray(value)) delete schema[key]
+  }
+  // A SCHEMA-valued keyword given something that is neither an object nor a
+  // boolean schema (`true` / `false` are legal 2020-12 and measured accepted)
+  // is dropped. Measured: `not: "x"`, `items: "x"`, `additionalProperties: "x"`
+  // and the other six all answer 11129 as sent.
+  for (const key of SCHEMA_CHILD_SINGLE) {
+    const value = schema[key]
+    if (value === undefined) continue
+    if (typeof value === 'boolean') continue
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) delete schema[key]
+  }
+  // `type` is the one keyword repaired rather than dropped. An unknown or
+  // malformed entry is removed from the union; a union left with a single member
+  // becomes that member, because `type: ["string"]` is accepted but needlessly
+  // odd; a union left with none goes, which leaves the unconstrained schema the
+  // same way an absent `type` would.
+  normalizeTypeKeyword(schema)
+}
+
+/**
+ * Repair `type`, keeping every member the upstream would have taken (issue #253).
+ *
+ * Measured: `type: ["string","null"]` is ACCEPTED as sent, and so is
+ * `dependencies`; only an unknown member (`type: "thing"`) or an empty array is
+ * refused. So this keeps valid members instead of rewriting the array into
+ * `oneOf`, which would be a much larger change to a schema the upstream already
+ * understands.
+ */
+function normalizeTypeKeyword(schema: Record<string, unknown>): void {
+  const type = schema['type']
+  if (type === undefined) return
+  const valid = (entry: unknown): entry is string => typeof entry === 'string' && JSON_SCHEMA_TYPES.has(entry)
+  if (typeof type === 'string') {
+    if (!valid(type)) delete schema['type']
+    return
+  }
+  if (!Array.isArray(type)) {
+    delete schema['type']
+    return
+  }
+  const kept = type.filter(valid)
+  if (kept.length === 0) {
+    // Measured: `type: []` is refused, and an absent `type` means the same
+    // unconstrained thing, so the keyword goes rather than becoming empty.
+    delete schema['type']
+    return
+  }
+  if (kept.length === type.length) return
+  schema['type'] = kept.length === 1 ? kept[0] : kept
+}
+
+/** The `type` values JSON Schema defines. */
+const JSON_SCHEMA_TYPES = new Set(['array', 'boolean', 'integer', 'null', 'number', 'object', 'string'])
+
+/** Keywords whose value must be a string. */
+const SCHEMA_STRING_KEYWORDS: readonly string[] = ['title', 'description', 'pattern', 'format', '$comment', 'contentMediaType', 'contentEncoding', '$id', '$schema', '$anchor', '$dynamicAnchor', '$dynamicRef']
+
+/** Keywords whose value must be a number. */
+const SCHEMA_NUMBER_KEYWORDS: readonly string[] = ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf', 'minLength', 'maxLength', 'minItems', 'maxItems', 'minProperties', 'maxProperties', 'minContains', 'maxContains']
+
+/** Keywords whose value must be a boolean. */
+const SCHEMA_BOOLEAN_KEYWORDS: readonly string[] = ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated']
+
+/**
+ * Keywords whose value must be a NON-EMPTY array of schemas.
+ *
+ * Measured: an empty `allOf` / `anyOf` / `oneOf` / `prefixItems` is refused
+ * (`11129`), while an empty `required` / `enum` / `examples` is ACCEPTED. Only
+ * these four are repaired, so a legal empty `required: []` keeps its bytes —
+ * which also keeps 5.24.2's "empty required string becomes `[]`" behaviour
+ * intact instead of turning it into an absent keyword.
+ */
+const SCHEMA_LIST_KEYWORDS: readonly string[] = ['allOf', 'anyOf', 'oneOf', 'prefixItems']
+
+/**
+ * Keywords whose value must be an array, where an EMPTY array is legal.
+ *
+ * `enum` and `examples` are accepted empty and NOT accepted as a scalar;
+ * `required` is accepted empty. Split from {@link SCHEMA_LIST_KEYWORDS} because
+ * that one also drops empties, which is wrong for these.
+ */
+const SCHEMA_STRING_LIST_KEYWORDS: readonly string[] = ['required', 'enum', 'examples']
 
 /**
  * Convert draft-4's tuple `items` into the 2020-12 spelling.
  *
  * A tuple `items` is a LIST; the modern spec splits it into `prefixItems` (the
  * per-position schemas, same order) plus `items` (the schema for everything
- * past the end). An explicit `additionalItems` boolean or schema remains the
- * tail constraint. Without one, `items: {}` keeps extra elements allowed.
+ * past the end). An explicit additionalItems boolean or schema remains the
+ * tail constraint, including an empty tuple. An unspecified tail remains open.
  *
  * Measured: `prefixItems` + `items: {}` answers 200 on `deepseek-v4.1-flash`,
  * `deepseek-v4-pro`, `glm-5.3`, `kimi-k3.1-pro` and `mimo-v2.6-pro` — the five
@@ -3805,10 +4049,16 @@ const SCHEMA_CHILD_SINGLE: readonly string[] = ['items', 'additionalProperties',
  */
 function normalizeItems(schema: Record<string, unknown>): void {
   const items = schema['items']
+  // Outside a tuple, additionalItems keeps its existing accepted spelling.
   if (!Array.isArray(items)) return
-  // A caller that already sent `prefixItems` wins: appending the tuple would
-  // produce two sources for the same positions.
-  if (schema['prefixItems'] === undefined) schema['prefixItems'] = items
+  if (items.length === 0) {
+    // An empty tuple has no positional schemas. Every element follows its
+    // explicit tail, and the upstream refuses an empty prefixItems array.
+    delete schema['prefixItems']
+  } else if (schema['prefixItems'] === undefined) {
+    // A caller-supplied prefixItems remains the positional source.
+    schema['prefixItems'] = items
+  }
   const tail = schema['additionalItems']
   schema['items'] = typeof tail === 'boolean'
     || (typeof tail === 'object' && tail !== null && !Array.isArray(tail)) ? tail : {}

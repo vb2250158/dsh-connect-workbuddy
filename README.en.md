@@ -12,7 +12,7 @@ This fork targets Windows x64, Node 24.15.0, pnpm 11.28.5 and the source Web Hos
 
 The upstream rc.3 development-line review remains an upstream record. This fork continues to prepare dependencies from its declared source Host; a future Host adoption is verified by the environment owner before the tested environment is updated.
 
-Outgoing tool parameters normalize legacy JSON Schema forms refused by upstream. An explicit tuple `additionalItems` boolean or schema moves to `items`, preserving the caller's tail constraint. An unspecified tail remains open. Internal references remain intact, and error 11129 guidance identifies the tool-definition diagnosis entry.
+Outgoing tool parameters normalize legacy JSON Schema forms refused by upstream. For empty and nonempty tuples, an explicit `additionalItems` boolean or schema moves to `items`, preserving the caller's tail constraint without emitting an empty `prefixItems`. An unspecified tail remains open. Internal references remain intact, and error 11129 guidance identifies the tool-definition diagnosis entry.
 
 <p align="center"><b>Connect locally signed-in WorkBuddy models — CN and international — to DeepSeek Harness: read each model's credit multiplier automatically, toggle image input per model, switch between multiple accounts, and keep daily check-in with a read-only credits overview in capsule readouts on the card and in the composer.</b></p>
 
