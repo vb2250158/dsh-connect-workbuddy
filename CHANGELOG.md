@@ -1,5 +1,119 @@
 # Changelog
 
+## 5.24.7-fork.1 (2026-11-16)
+
+- 合入上游 PR259 的元组尾部修复与调用方 prefixItems 保留，保留维护 fork 的实例心跳归属及固定环境检查。
+- 同步上游默认关闭的会话前缀亲和键实验、可信 Host 配置与卡片403错误指引。现有配置不自动启用新增选项。
+- 修复可信地址显式指定默认端口时，被 URL 归一化误当作任意端口授权的问题；保留无端口地址的原有语义。
+- 新 Client 候选的可见交互验收仍待环境维护，源码发布与正式采用分别记录。
+
+## 5.24.7 (2026-11-15)
+
+> 版本号是 **patch**：默认行为零变化，修一处只在反代部署下触发的全量 403，并新增一个默认
+> 关闭的可选配置项；无接口变化、无破坏性改动。来自 issue #261。
+
+### 新增：`trustedHosts`——反代部署下卡片路由不再全量 403（issue #261）
+
+把 DSH 装在 Docker / 服务器、前面挂反向代理时，插件设置卡片会整块空白、所有
+`/plugins/dsh-connect-workbuddy/*` 返回 `403 {"error":"host-not-trusted"}`，而 DSH 自己的
+页面与 `/api` 正常。原因是卡片路由的 Host/Origin 闸门拿 `req.socket.localAddress` 与 `Host`
+比较，而反代后面宿主绑定回环、这个值恒为 `127.0.0.1`，浏览器发来的对外 authority 永远对不上；
+宿主自己的栅栏用 `dsh web --trusted-host` 声明的 authority 放行同一个 Host，于是两边分叉。
+
+- **新增默认空的 `trustedHosts` 配置**（volatile、请求时读取，改动无需重载）。元素是裸
+  `host[:port]`：不带端口匹配该主机名任意端口，带端口精确匹配该 authority；加载期逐条校验，
+  写错直接报错而不是悄悄授权一个前缀。Host 与 Origin 两道闸门共用同一份列表与同一套
+  WHATWG 归一化（大小写、IPv6 括号、scheme 默认端口）。
+- **默认行为零变化**：空列表时回环、LAN 绑定、`0.0.0.0`/`[::]` 显式拒绝、DNS rebinding 防护
+  全部与之前一致。白名单只把「本机地址」的定义从「socket 落在哪」扩展到「部署方声明的权威」，
+  与宿主 `--trusted-host` 对齐；Host/Origin 本就可伪造、不是鉴权，威胁模型不变。
+- **不读宿主的 `connection.trustedHosts`**：该字段在 `HostConnectionService` 上是 private，
+  且依赖另一个服务在场会让 `connection` 缺席时卡片整块消失。白名单放在本插件自己的 Config，
+  自包含、与宿主版本无关（详见 `docs/ISSUE-261-REPLY.md`）。
+- **卡片不再把 403 吞成空白**：`refreshUsage` 现在读响应体里的 `error`，对
+  `host-not-trusted` / `origin-not-trusted` 给一条专属、可操作的提示（改本机地址打开，或配
+  `trustedHosts`），并抑制「重新登录 WorkBuddy」「服务可能刚重启」这两条对此**事实错误**的建议；
+  其它 403 / 500 / 未登录仍走原路径。带一个「重试」按钮，修好后可立即重读。
+
+验证：`tests/loopback.spec.ts`（信任判定 + authority 校验）、`tests/web-status.spec.ts`（反代
+场景 403→200、未命中仍 403、Origin 半边、端口语义、空列表等价）、`tests/issue261-gate-hint.spec.tsx`
+（门禁码专属文案、其它错误零影响、恢复后清除）。三层各做一次变异验证：禁用信任匹配 / 放宽门禁码
+判定 / 移除 Origin 半边信任，对应测试均转红。
+
+## 未发布（实验性开关，默认关闭）
+
+### 新增：可选 `stableConversationId`（opt-in，默认 `false`）
+
+新增一个**默认关闭**的实验性配置开关 `stableConversationId`，用于让使用者在受控条件下对照
+「稳定 `X-Conversation-ID` 与隐式前缀缓存命中之间的关系」。语义与已知限制的权威定义见
+[`docs/STABLE-KEY-SEMANTICS.md`](docs/STABLE-KEY-SEMANTICS.md)（路线 A：请求前缀派生的亲和键实验）。
+
+- **默认行为零变化**：`stableConversationId` 默认 `false`，默认路径中 `X-Conversation-ID` 等三件套
+  仍然每请求现生成、互不相同。
+- **开启后只影响 `X-Conversation-ID`**：由 `deriveStableConversationId(bodyJson)` 从
+  `model` + 首条 `system` + 第一条真实 `user` 经规范化后派生一个 v4 形状的稳定值；
+  `X-Conversation-Request-ID` / `X-Conversation-Message-ID` / `X-Root-Request-ID` 仍每请求现生成。
+- **配置在插件挂载时采样一次**，改动后需重载插件才生效。
+- 派生键派生自请求内容，**不是宿主 `sessionId`**：压缩 / 首问变化 / 模型切换 / 会话分叉都可能换键，
+  前缀相同的独立会话会共享键；解析失败或缺字段时显式回退到每请求现生成。
+
+> 本开关是实验性、默认关闭的可选能力。**不附带任何命中率实测结论、不声称稳定 ID 能改善命中、
+> 不区分上游缓存键分区与路由亲和等内部机制，也不推广默认值。** 真实上游实验、完整链路验证与 GA
+> 决策属于后续单独工作，须由使用者在指定构建/账号/模型/时间窗口下自行验证并采用限定措辞。
+
+验证：新增 `tests/upstream.spec.ts` 的离线 wire 级单测（默认关闭字节一致、派生键稳定性与回退、
+注入块跳过、多模态首问、NUL 歧义、无状态泄漏等）。
+
+## 5.24.6 (2026-11-15)
+
+> 版本号是 **patch**：修一处「工具声明被悄悄放宽」的语义丢失，无新增配置项、无接口变化。
+> 来自 PR #259（vb2250158 / 秋雨之忆）。
+
+### 修复：显式 `additionalItems: false` 被丢成「接受任意元素」
+
+draft-4 的 tuple `items` 转成 2020-12 的 `prefixItems` + `items` 时，尾部约束被一律写成 `items: {}`。
+`{}` 的意思是「什么都可以」，但调用方可能写的是：
+
+```json
+{ "type": "array", "items": [{"type": "string"}], "additionalItems": false }
+```
+
+`additionalItems: false` 是一个**显式闭合声明**——「超出这个位置的东西一律不接受」。把它变成 `{}`
+等于把约束**放宽**，工具会接受调用方明确说过不接受的多余元素。
+
+这正是本项目在 5.24.2 的注释里写过、却在实现里做反了的事：「硬造一个约束比丢掉一个约束更糟」是对的，
+但**丢掉调用方真实写下的约束同样是错的**，而且更隐蔽——它不报错，只是让声明变得比原来宽松。
+
+现在显式的布尔值或 schema 尾部都会被保留：`false` → `items: false`，`true` → `items: true`，
+对象 → `items: <schema>`（并递归归一），缺省 → 继续开放为 `{}`。
+
+实测 `items: false` / `items: true` 在 `deepseek-v4.1-flash` 上全部 200，所以保留它们不引入新拒绝。
+
+### 评审补充：空 tuple 时不能丢掉调用方自己的 `prefixItems`
+
+原实现遇到空 tuple 会无条件 `delete prefixItems`。但「空 tuple」和「调用方写了非空 `prefixItems`」
+是两件事：
+
+```json
+{ "items": [], "prefixItems": [{"type": "string"}], "additionalItems": false }
+```
+
+实测这个组合**原样发送会被拒**（11129），而**丢掉空 tuple、保留 `prefixItems`** 则 200。
+所以该丢的是空 tuple，不是调用方真实的位置声明——删掉它会重现同一类「声明被放宽」的问题。
+
+### 评审补充二：一条名不副实的守卫测试
+
+本 PR 删掉了 5.24.5 的一条测试，而那条在当时是有效的变异守卫。恢复后**重新做变异**才发现：
+它其实抓不到「禁用空 tuple 分支」——因为后跑的类型修复也会删掉空 `prefixItems`，两条代码路径的
+可见输出完全相同。原注释写着「this is the mutation that matters」，**这句话是错的**。
+
+已改成如实说明：这条测试钉的是最终结果，不是那个分支本身；分支仍然保留，理由是它防的是两遍处理的
+顺序（万一将来类型修复不再删空 `prefixItems`，或跑到前面去，这个分支仍然是兜底）。
+
+保留一条抓不住变异的测试是可以的，**但注释不能声称它抓得住**。
+
+变异验证：尾部不认布尔 → 红 5 条；空 tuple 无条件删 `prefixItems` → 红 1 条。
+
 ## 5.24.5-fork.1 (2026-11-15)
 
 - 合入上游请求体字节超限历史折叠、工具参数关键字类型修正与 11129 提示，保留实例心跳归属及固定源码宿主检查。
