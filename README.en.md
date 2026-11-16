@@ -4,6 +4,8 @@
 
 <h1 align="center">dsh-connect-workbuddy</h1>
 
+The account-expiry view from upstream 5.24.9 is available in the card and composer account panel. It identifies the account and amount due to expire, with the expiry time in the card or row hover text.
+
 Host heartbeat cleanup belongs to the plugin instance that successfully wrote it. Manual callers retain the result of `await writeHostHeartbeat()` and pass it to `clearHostHeartbeat(owner)`. An unwritten startup or a superseded registration preserves the current Host receipt.
 
 ## Maintained fork environment

@@ -4,6 +4,8 @@
 
 <h1 align="center">dsh-connect-workbuddy</h1>
 
+上游 5.24.9 的账号积分临期提示已接入卡片与编写器账号面板，显示当前账号的临期数量，并通过日期或悬停文本提供到期时间。
+
 宿主状态心跳由成功写入它的插件实例清理。通过公开函数手动管理时，保存 `await writeHostHeartbeat()` 返回的回执，再交给 `clearHostHeartbeat(owner)`。未写入的启动与已被新实例替换的回执不会删除当前宿主状态。
 
 <p align="center"><b>把本机登录的 WorkBuddy 模型（国内版与国际版）接入 DeepSeek Harness —— 每次刷新自动读取每个模型的积分倍率，逐模型开关图片输入，多账号可切换，并带每日签到与只读积分概览（卡片与输入框里的胶囊读数）。</b></p>
