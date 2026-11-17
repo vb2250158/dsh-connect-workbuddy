@@ -1092,6 +1092,7 @@ export function isToolSchemaRejectBody(body: string): boolean {
  */
 const TOOL_SCHEMA_REWRITTEN_KEYWORDS = '元组式 `items`、布尔 `exclusiveMinimum`/`exclusiveMaximum`、`required` 非数组或含重复项、外部 `$ref`'
   + '，以及关键字的值类型写错（如 `title: 1`、`minimum: "0"`、`allOf: {}`、`type: []`、`enum`/`examples` 写成标量）'
+  + '，以及 `pattern` 里的 UTF-16 代理区转义 `\\uD800`–`\\uDFFF`'
 
 /**
  * One actionable sentence for a `11129` refusal, naming what was already fixed
@@ -2030,6 +2031,41 @@ export function deriveStableConversationId(bodyJson: string): string | undefined
   // by JSON.stringify, so (a, b, c) and (a\0b, c) can never collide.
   const tuple = JSON.stringify([STABLE_KEY_SCHEME, model, systemKey, firstRealUserKey])
   const digest = createHash('sha256').update(tuple).digest('hex')
+  return formatAsUuidV4(digest)
+}
+
+/**
+ * Route B: version tag for mapping a HOST session id onto a v4-shaped
+ * conversation id. Deliberately different from {@link STABLE_KEY_SCHEME} so a
+ * session-derived id can never equal a prefix-derived (route A) id — the two
+ * routes must not silently share an upstream affinity bucket.
+ */
+const SESSION_CONVERSATION_KEY_SCHEME = 'dsh-session-conversation-id/v1'
+
+/**
+ * Map a host session id to a v4-SHAPED `X-Conversation-ID` (route B).
+ *
+ * The REAL session id never leaves this process: only this digest is put on the
+ * wire. The digest is domain-separated from route A and from any other hash use,
+ * so the same text cannot collide with a prefix-derived affinity key. The input
+ * is trimmed and length-capped (a defensive bound on a loopback-only header):
+ * an empty or over-long value yields `undefined`, which makes the caller fall
+ * back to the ordinary per-request id rather than send anything derived from
+ * malformed input.
+ *
+ * This is a stable, deterministic LOCAL mapping, NOT the host session id itself
+ * and NOT a claim that the upstream keys any cache by session. It makes no
+ * assertion about upstream internal mechanism (cache-key partitioning vs routing
+ * affinity are indistinguishable from here). See `docs/ROUTE-B-SESSION-ID.md`.
+ */
+export function conversationIdFromSessionId(sessionId: string): string | undefined {
+  const trimmed = sessionId.trim()
+  if (trimmed === '' || trimmed.length > 256) return undefined
+  const digest = createHash('sha256')
+    .update(SESSION_CONVERSATION_KEY_SCHEME)
+    .update('\0')
+    .update(trimmed)
+    .digest('hex')
   return formatAsUuidV4(digest)
 }
 
@@ -3898,6 +3934,7 @@ function normalizeToolChoice(obj: Record<string, unknown>): void {
  * | `required` as a STRING instead of an array | 11129 | one-element array |
  * | `required` containing DUPLICATES | 11129 | de-duplicated |
  * | an EXTERNAL `$ref` (`https://…`, `//host/…`) | 11129 | the reference object removed |
+ * | a `pattern` with a `\uD800`–`\uDFFF` surrogate escape (issue #274) | 11129 | the offending `pattern` dropped |
  *
  * WHAT IS DELIBERATELY NOT TOUCHED.
  *
@@ -3975,6 +4012,7 @@ function normalizeSchemaNode(node: unknown, depth = 0): void {
   normalizeRequired(schema)
   dropExternalRef(schema)
   normalizeMetaSchemaTypes(schema)
+  normalizePatternSurrogates(schema)
 
   for (const key of SCHEMA_CHILD_MAPS) {
     const child = schema[key]
@@ -4110,6 +4148,65 @@ function normalizeMetaSchemaTypes(schema: Record<string, unknown>): void {
   // same way an absent `type` would.
   normalizeTypeKeyword(schema)
 }
+
+/**
+ * Drop a `pattern` whose regex contains a UTF-16 SURROGATE escape (issue #274).
+ *
+ * THE REPORT. A user enabled the REA MCP server and every message answered
+ * `400 / 11129` on `deepseek-v4.1-flash`; turning the server off made the same
+ * sentence pass. The reporter pasted all 260 tool schemas — and, as with the
+ * second #253 report, their value was the METHOD: the definitions were clean of
+ * every rewrite this module already owns (fed through `prepareChatBody`, all 260
+ * came out BYTE-IDENTICAL), so the refusal had to be a shape nobody had looked
+ * for. The one construct no other tool shared was a regex escape for the
+ * surrogate code-unit range:
+ *
+ *   "allOf": [{ "pattern": "^[^\\uD800-\\uDFFF]*$" }]
+ *
+ * MEASURED, one body at a time on the real CN gateway, `deepseek-v4.1-flash`:
+ *
+ *   - the two tools carrying that escape (`close_binary`, `binary_session`)
+ *     answer 11129 alone; the other three exposed tools answer 200;
+ *   - removing ONLY that `allOf` member makes the tool pass (removing the NUL
+ *     and slash members instead does not) — it is this escape, not `allOf`
+ *     or the regex class around it;
+ *   - the boundary is exact: `\uD7FF` and `\uE000` answer 200, every escape in
+ *     `\uD800`–`\uDFFF` answers 11129 (upper/lower/mixed hex digits alike);
+ *   - the rejection is SPECIFIC TO `pattern`: the same literal in `description`,
+ *     `title`, `const`, `enum`, `default` and `format` all answer 200;
+ *   - other escapes are fine — `\u0000`–`\uFFFF`, `\x00`, `\d`, an ASCII hex
+ *     range, even a literal emoji (a real surrogate pair in the JSON) all pass.
+ *     It is specifically the `\uXXXX` SPELLING of a surrogate code unit that
+ *     the upstream's schema parser cannot take.
+ *
+ * WHY DROP THE PATTERN, NOT THE TOOL OR THE ESCAPE. The pattern is an ANNOTATION
+ * constraint — REA used it to reject lone surrogates in a filesystem path. The
+ * MCP server still validates complete canonical inputs on its side, so removing
+ * the display copy cannot let an invalid path through. Rewriting `\uD800` into
+ * an equivalent character class would be a guess about the upstream parser the
+ * evidence does not support; dropping one member's constraint keeps the tool
+ * callable and matches the "repair, never silently remove a capability" rule
+ * from {@link normalizeMetaSchemaTypes}. The member left `{}` is harmless:
+ * `allOf: [{}]` was measured at 200, and an `allOf` emptied entirely is already
+ * dropped by `normalizeMetaSchemaTypes` (an absent constraint means what an
+ * empty one says). So the drop is all that is needed — no pruning pass, no
+ * change to the schema's structure.
+ *
+ * A correct schema — no surrogate escape — leaves this function byte-identical,
+ * so the prompt prefix stays stable for caching.
+ */
+function normalizePatternSurrogates(schema: Record<string, unknown>): void {
+  const pattern = schema['pattern']
+  if (typeof pattern !== 'string' || !SURROGATE_ESCAPE_RE.test(pattern)) return
+  delete schema['pattern']
+}
+
+/**
+ * A `\u` escape whose four hex digits name a UTF-16 surrogate code unit
+ * (D800–DFFF). Case-insensitive on the hex digits: `\ud800` and `\uDaFf` are
+ * refused just like the uppercase spelling (measured).
+ */
+const SURROGATE_ESCAPE_RE = /\\u[dD][89a-fA-F][0-9a-fA-F]{2}/u
 
 /**
  * Repair `type`, keeping every member the upstream would have taken (issue #253).
@@ -4993,6 +5090,13 @@ export class WorkBuddyUpstreamClient {
     credential: WorkBuddyCredential,
     bodyJson: string,
     signal?: AbortSignal,
+    /**
+     * Route B (opt-in): the loopback-only session id the shim read from the
+     * adapter-stamped affinity header, ALREADY mapped to a v4-shaped digest by
+     * the caller. When present it takes precedence over the route-A prefix key.
+     * Purely additive: existing three-argument callers are byte-identical.
+     */
+    sessionConversationId?: string,
   ): Promise<WorkBuddyChatResult> {
     let response: Response
     // Deliberately NO ceiling of our own here, unlike `probeChat`.
@@ -5017,9 +5121,14 @@ export class WorkBuddyUpstreamClient {
       // chatHeaders 收到 undefined，不进入稳定键分支。开启时从请求体不变前缀
       // 派生一个 v4 形状的 X-Conversation-ID；该值是前缀亲和键，不是宿主会话
       // 标识，也不对上游内部机制作断言（见 docs/STABLE-KEY-SEMANTICS.md）。
-      const stableId = identity.stableConversationId === true
-        ? deriveStableConversationId(bodyJson)
-        : undefined
+      // 路线 B（默认关）：调用方（shim）传入已做过域隔离摘要的会话亲和键时
+      // 优先采用，路线 A 的派生不再运行；两路都关或 B 值缺席时行为与从前
+      // 完全一致（见 docs/ROUTE-B-SESSION-ID.md）。
+      const stableId = sessionConversationId !== undefined && sessionConversationId !== ''
+        ? sessionConversationId
+        : identity.stableConversationId === true
+          ? deriveStableConversationId(bodyJson)
+          : undefined
       const headers = {
         ...chatHeaders(credential, identity, stableId),
         'Authorization': `Bearer ${credential.accessToken}`,

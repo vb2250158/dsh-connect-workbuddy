@@ -10,6 +10,8 @@ Host heartbeat cleanup belongs to the plugin instance that successfully wrote it
 
 ## Maintained fork environment
 
+This update integrates upstream 5.24.14: the `sessionConversationId` experiment stays off by default, OAuth account identity recovery is fixed, and tool-schema `pattern` normalization covers the full D800–DFFF surrogate range. Existing account pools, heartbeat ownership and trusted-address settings retain their behavior.
+
 This fork targets Windows x64, Node 24.15.0, pnpm 11.28.5 and the source Web Host at Core commit `54931fbd25050ef036e44b1daec931da2bfe7b39` (0.2.2-rc.1). See [tested-environment.json](tested-environment.json). In an isolated development checkout, set `DSH_HARNESS` to that installed and built Core, run `node scripts/prepare-tested-host.mjs`, then `pnpm install --no-frozen-lockfile` before the existing checks. Environment maintenance records formal adoption separately. Reports and pull requests for other environments are reviewed from concrete reproductions.
 
 The upstream rc.3 development-line review remains an upstream record. This fork continues to prepare dependencies from its declared source Host; a future Host adoption is verified by the environment owner before the tested environment is updated.
