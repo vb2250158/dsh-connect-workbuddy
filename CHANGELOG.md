@@ -1,5 +1,117 @@
 # Changelog
 
+## 5.24.17-fork.1 (2026-11-19)
+
+- 合入上游 5.24.15 至 5.24.17：默认启用前缀派生的会话亲和键，修复长会话 422 的救援判定，并在账号读取中或失败时保留导入入口。
+- 显式关闭的亲和键设置和默认关闭的宿主会话键保持；保留维护版的账号池、心跳归属、可信地址端口和完整代理区匹配。Web 正式采用另行验收。
+
+## 5.24.17 (2026-11-19)
+
+> 版本号是 **patch**：只改一处 UI 挂载点——让账号导入导出工具区在「正在加载账号」和账号文档
+> 读取失败两种状态下也渲染；不改后端、不改导入逻辑、不改任何开关语义。来自 issue #279。
+
+### 修复：账号导入不该被账号状态挡住——加载中与读取失败时也能导入
+
+issue #279 报告：无本机 WorkBuddy 登录时看不到账号导入导出，无法把账号迁移到 Docker / Linux
+部署。核查后发现导入后端与账号状态**本来无关**——`/transfer?action=import` 只是把文件里的凭据
+写进本地 vault，不需要已解码的登录；signed-out（已确认未登录）分支也早就渲染了导入按钮。
+
+真正的问题在首屏的 **loading 状态**：账号文档尚未返回时，整个账号工具区（含导入按钮）都不渲染；
+账号文档读取失败（error 状态）时同样不渲染。报告者的截图正好停在「正在加载账号…」，于是表面
+上成了「没账号就导不了」。这条链把「能不能导入」绑到了「账号读取有没有回答」——而对一台全新机器
+来说，导入恰恰是获得第一个账号的**唯一**途径。
+
+改法：把已有的 `accountTools`（OAuth 扫码 + 导入导出）在 loading 与 error 两个分支各渲染一份。
+四种账号状态（加载中 / 未登录 / 已登录 / 读取失败）互斥，同一时刻仍只有一份工具区，不会出现两个
+文件 input 抢 ref。signed-in 仍走 `AccountPool` 插槽、signed-out 仍走原分支，位置与顺序不变。
+
+**不采纳的部分（issue #279 第 1 条）**：模型列表「刷新时用上游当前列表覆盖 + 保留上游已下架但
+仍在用的模型」是 issue #32 的有意设计——避免刷新打断正在使用的会话；「清空重写」会推翻这条保护。
+目录本身已按国内版 / 国际版分别保存在本地，手动刷新一次即可跟上当前列表。
+
+守护测试（`tests/issue77-card-first-paint.spec.tsx`）：loading 状态断言导入按钮可见且工具区恰好
+一份；新增 error 状态用例断言同样可见。双向变异验证：摘掉 loading 那份红 1 条、摘掉 error 那份
+红 1 条，恢复后相关 8 条全绿。
+
+## 5.24.16 (2026-11-19)
+
+> 版本号是 **patch**：只在 `isBodyOversizeRefusal`（长会话 422 救援的第一层入口判定）里补两种
+> 语义措辞，不改折叠目标、不改池子选号、不改任何开关语义或出站头；无破坏性改动。来自 issue #278。
+
+### 修复：长会话 422 仍进不了救援——入口判定漏认 bili 当前实际的拒绝措辞
+
+承接 #258。#258 把「请求体字节超限」接进了历史折叠链：第一层认出字节超限后在回复里插入
+`prompt is too long (request body exceeded the local byte limit)`，第二层 `rescueCauseOf` 据此
+按 `body-bytes`（当前测量 × 0.9）折叠。方向是对的，但 #278 在 5.24.15 上实测发现**第一层
+一次都没命中**，于是第二层永远不执行，长会话仍稳定 422、永久卡死。
+
+两处漏认：
+
+1. **#258 的测试喂的是日志行，不是响应体。** `8,401,132 B > 8,388,608 B` 这串只出现在
+   bili 的 `logHostEvent` 日志里，宿主拿到的 422 body 里根本没有字节比较。报告者照着日志写
+   了正例，测试全绿，真实链路上一次都匹配不上。「修好的目标从没被够到」。
+2. **匹配器要的短语和实际报文差一点。** 它认 `byte limit` + `refused locally`；bili 0.1.216
+   实际写的是 `byte ceiling` + `refused this request locally`——两个词都差一截，双否。
+
+改法：不写死任何组件标识符（`docs/DESIGN.md` §零 第 4 条——写死别人的标识符属于「随代码走」，
+对方改名或消失后代码还留着），只补两条语义判断：`byte ceiling` 与 `byte limit` 是同一件事的
+两种英文说法；`silent-direct` + `refus` 描述的是「这条请求因为不能直连发送而被本地拒绝」，
+与谁生成的无关。同步把函数注释里「每条真实拒绝都带字节比较」的过时说法改成事实：数值比较在
+日志里、不在响应体里。
+
+**边界（如实说明）**：0.1.216 已把这族报文的 token 口径变体（"priced over the model's
+context window"）刻意留在匹配之外——它没有 `byte`、也没有 `silent-direct`，继续交给
+`isContextOverflow` 处理，避免两个权威竞争同一个失败。这部分属于 bili 侧（其 PR #6546
+尚未合入 0.1.216），本插件不越界。折叠后重发的 body 是否确实低于 8 MiB 仍未验证——8 MiB 是
+bili 的内部常量，不在本仓库手里；能证明的只有入口判定会命中、会进救援、目标一定低于当前测量。
+
+守护测试（`tests/issue258-body-oversize-rescue.spec.ts`）：三条真实 422 body 正例（含把整条
+报文送进 `rescueCauseOf` 的第二层验证）、四条反例（token 口径 / proxy 挂掉 / 429 / 普通
+400），双向变异验证——摘掉 `byte ceiling` 红 1 条，摘掉 `silent-direct + refus` 红 1 条，
+把判定放宽成任意 `refus` 红 1 条（反例咬住），全部恢复后 20 条全绿。
+
+## 5.24.15 (2026-11-18)
+
+> 版本号是 **patch**：两处改动——`package.json` 的一处 peer 元数据声明（#277），以及把
+> `stableConversationId` 的默认值从 `false` 翻成 `true`（#275，会改变出站的一个头）。
+> 池子选号、账号身份、开关语义一律未动。来自 issue #277 与 #275。
+
+### 改进：稳定会话键（路线 A）默认开启，提升前缀缓存复用
+
+`stableConversationId` 自 5.24.15 起默认 `true`：默认路径从请求体**不变前缀**（model +
+首条 system + 第一条真实 user）派生 `X-Conversation-ID` 亲和键，让同一段对话复用上游隐式
+前缀缓存；`X-Conversation-Request-ID` / `X-Conversation-Message-ID` / `X-Root-Request-ID`
+仍每请求现生成。设为 `false` 即回到「每请求现生成三件套」的原形状。
+
+默认值从 `false` 翻到 `true` 依据 #275 的完整证据链：冻结单变量实验（20 组冷前缀，
+`BENEFIT_SUPPORTED`），维护者本人在全新 checkout 上的独立复现（`MEAN_D 87.1pp
+[81.9, 92.0]`，240/240 完整，与此前报告者读数同向、CI 重叠），加上真实多轮稳态 80–90%
+的观察。这是**独立决策**，不是实验成功的自动结果。
+
+**边界（如实说明）**：`87.1pp` 来自逐字节固定的人工长前缀逐轮重发，不等于真实多轮收益；
+`MECHANISM_PROVEN=false`，区分不了缓存键分区与路由亲和，不外推到其它账号 / 模型 / 端点。
+该值是前缀派生亲和键、不是宿主会话标识，相同前缀的独立会话会共享同一个键。开关在插件
+挂载时采样一次，改动后需重载插件才生效。路线 B（`sessionConversationId`）仍默认关闭。
+语义与限制见 `docs/STABLE-KEY-SEMANTICS.md`。
+
+### 改进：把 `react` 标成可选 peer，允许在 DSH Go（鸿蒙 / iOS）上安装
+
+此前 `peerDependencies.react` 是 `^18.2.0`，但 `peerDependenciesMeta` 只把
+`@earendil-works/pi-ai` 标成了 optional。DSH Go 的鸿蒙 / iOS 安装器共用同一份依赖图
+解析器（`resolveGraph`），对每个 peer 只接受两种落点：命中宿主包表，或
+`peerDependenciesMeta[name].optional === true`。`react` 两者都不占，于是在解析阶段直接报
+`ERR_OHOS_PLUGIN_PACKAGE: unsupported non-host peer react`——尚未下载、未写 profile。
+
+本插件的 `lib/client.js` 确实 require `react` / `react/jsx-runtime` / `react-dom`，但这些前端库
+由宿主 Web 运行时的 `window.__ModuleLoader__` 注入，不来自 node_modules；`lib/index.js` 与
+`lib/bin.js` 对 React 零引用。因此把 `react` 标成 optional 只移除安装期的硬校验，不改变运行时
+行为：一旦环境提供 react，仍须满足 `^18.2.0` 的版本约束。
+
+**证据边界（如实说明）**：iOS 侧有实测——runtime 压缩包内无 react / react-dom 的 package.json，
+而 runtime 自带 client 包在同一注入机制下 require React 能正常运行；鸿蒙侧尚无真机 / 模拟器
+实测，安装包解析通过后 client 能否加载取决于宿主 WebView 是否同样注入 React。本次只解决
+「装不上」，不代表已验证鸿蒙端运行。
+
 ## 5.24.14-fork.1 (2026-11-18)
 
 - 合入上游 5.24.10 至 5.24.14 的会话亲和键开关、OAuth 账号识别与 REA 工具 schema 修复；现有账号池、心跳归属、可信地址显式端口和元组约束保持。

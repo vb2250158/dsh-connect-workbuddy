@@ -32,7 +32,7 @@
 
 ### 维护 fork 的受测环境
 
-本轮同步上游 5.24.14：新增默认关闭的 `sessionConversationId` 实验选项，修复 OAuth 账号资料识别，并完整覆盖工具 schema `pattern` 中 D800–DFFF 的代理区转义。默认账号池、心跳与可信地址设置保持原有行为。
+本轮同步上游 5.24.17：账号读取中或失败时仍可导入，长会话的字节超限响应可触发既有恢复。前缀派生的 `stableConversationId` 默认开启，可显式设为关闭；宿主会话键 `sessionConversationId` 仍默认关闭。维护版保留 OAuth 账号识别、工具 schema `pattern` 的完整代理区处理，以及账号池、心跳和可信地址设置。
 
 本 fork 使用 Windows x64、Node 24.15.0、pnpm 11.28.5，宿主为 Core 源码 `54931fbd25050ef036e44b1daec931da2bfe7b39`（0.2.2-rc.1）的 Web 入口。固定版本见 [tested-environment.json](tested-environment.json)。在独立开发副本中设置 `DSH_HARNESS` 指向已安装并构建的该源码，再运行 `node scripts/prepare-tested-host.mjs` 和 `pnpm install --no-frozen-lockfile`，可让现有检查使用当前宿主依赖。采用状态由环境维护记录单独确认。社区其它环境的具体问题和 PR 按实际复现评审。
 
