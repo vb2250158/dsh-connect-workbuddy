@@ -14,6 +14,8 @@
 
 import type { WorkBuddyBusyLevel } from './busy.ts'
 import type { WorkBuddyPromo } from './promo.ts'
+import { parseUpstreamResetAt, redactUpstreamText } from './probe.ts'
+import type { WorkBuddyCatalogDegradation } from './upstream.ts'
 
 /** Plugin-owned usage endpoint consumed by its browser half. */
 export const WORKBUDDY_USAGE_PATH = '/plugins/dsh-connect-workbuddy/usage'
@@ -198,15 +200,16 @@ export function oauthActionOf(url: string): WorkBuddyOAuthAction | undefined {
   return value === 'start' || value === 'poll' ? value : undefined
 }
 
-/** The pool batch actions. `remove` is per-account and never batch-wide. */
-export type WorkBuddyPoolAction = 'checkin' | 'test' | 'remove'
+/** The pool batch actions. `remove` is per-account and never batch-wide; the two growth actions are manual equivalents of the opt-in background jobs (issue #286). */
+export type WorkBuddyPoolAction = 'checkin' | 'test' | 'remove' | 'growth-redeem' | 'growth-activity'
 
 /** Read the pool action off a request URL; unknown/absent means undefined. */
 export function poolActionOf(url: string): WorkBuddyPoolAction | undefined {
   const at = url.indexOf('?')
   if (at === -1) return undefined
   const value = new URLSearchParams(url.slice(at + 1)).get(WORKBUDDY_POOL_ACTION_PARAM)
-  return value === 'checkin' || value === 'test' || value === 'remove' ? value : undefined
+  return value === 'checkin' || value === 'test' || value === 'remove'
+    || value === 'growth-redeem' || value === 'growth-activity' ? value : undefined
 }
 
 /** Query parameter naming ONE pool account a per-row request addresses. */
@@ -1375,6 +1378,70 @@ export interface WorkBuddyWebSearchPath {
  */
 export type WorkBuddyWebRegion = 'cn' | 'global'
 
+/**
+ * This region's model directory is a PARTIAL answer (issue #288).
+ *
+ * The international region reads two product documents that publish different
+ * rosters, and the CN region falls back to a legacy document when the modern
+ * one stops answering. Either way a refused read is answered from the other
+ * document — and the answer is missing rows the upstream does publish.
+ *
+ * The card needs this to tell TWO apart that look identical on screen:
+ *
+ *   - "the directory only has one model" (the user's own selection), and
+ *   - "the directory could not be read, so this is what survived" (a rate
+ *     limit, a transport error).
+ *
+ * Without it the second case was silent, and the user could not tell that the
+ * list they were looking at was a fallback rather than the upstream's offer.
+ */
+export interface WorkBuddyWebCatalogDegradation {
+  /** The document that was NOT read. */
+  missing: 'app' | 'cli' | 'legacy'
+  /** The document the answer came from instead. */
+  used: 'app' | 'cli' | 'legacy'
+  /**
+   * The upstream's own words about the failure, redacted and truncated.
+   *
+   * The upstream states its recovery time in prose, so this sentence is worth
+   * showing verbatim — it is the only place the user learns when the limit
+   * lifts.
+   */
+  reason: string
+  /**
+   * The recovery time the upstream stated, in epoch ms.
+   *
+   * ABSENT means "the upstream named no time" — never "now" and never a guess.
+   */
+  resetAtMs?: number
+}
+
+/**
+ * Project the Host's degradation onto the wire shape.
+ *
+ * The upstream's body is REDACTED before it crosses to the browser, for the
+ * same reason the pool redacts it before it touches the disk: this is a raw
+ * upstream string, and a failure body that happens to carry a token-shaped
+ * fragment must not be shown on screen (see `redactUpstreamText`).
+ *
+ * The recovery time is PARSED from that body rather than carried by the
+ * upstream layer, so the parser that reads the upstream's two spellings
+ * (Chinese and English) stays the one this codebase already uses for the pool's
+ * cooldowns — a second copy of it would be a second chance to loosen it.
+ */
+export function toWebCatalogDegradation(
+  degradation: WorkBuddyCatalogDegradation,
+): WorkBuddyWebCatalogDegradation {
+  const reason = redactUpstreamText(degradation.body.trim())
+  const resetAtMs = parseUpstreamResetAt(degradation.body)
+  return {
+    missing: degradation.missing,
+    used: degradation.used,
+    reason,
+    ...resetAtMs === undefined ? {} : { resetAtMs },
+  }
+}
+
 /** The JSON document the plugin card renders. */
 export type WorkBuddyWebUsage =
   /**
@@ -1531,6 +1598,17 @@ export type WorkBuddyWebUsage =
     message?: string
     /** The persisted account id matches no local account. */
     selectionLost?: boolean
+    /**
+     * The upstream refused the credential that `resolve()` tried to refresh
+     * (issue #285). Distinct from a genuinely signed-out machine: local accounts
+     * ARE present (`accounts` is populated and the export dialog can see them),
+     * but the selected token was rejected. Without this marker the card fell
+     * into the generic signed-out branch, hid every account, and told the user
+     * "未登录" in both the settings card and the model picker.
+     */
+    credentialRejected?: boolean
+    /** Present only alongside {@link credentialRejected}. */
+    recovery?: WorkBuddyWebRecovery
     /**
      * The vault directory exists but could not be READ (issue #199).
      *
@@ -1700,6 +1778,15 @@ export type WorkBuddyWebUsage =
     models: readonly WorkBuddyWebModel[]
     enabledModelIds: readonly string[]
     imageModelIds: readonly string[]
+    /**
+     * This region's model directory is a PARTIAL answer (issue #288).
+     *
+     * ABSENT means "the directory is the upstream's whole offer" — the two
+     * states are different facts and the card says different things about
+     * them, so the field is absent rather than false when there is nothing to
+     * report.
+     */
+    catalogDegraded?: WorkBuddyWebCatalogDegradation
     /**
      * Model ids whose `off` thinking level is offered (issue #34): the saved
      * selection, seeded from the built-in rule the first time it is read.
@@ -2029,6 +2116,16 @@ export interface WorkBuddyWebPoolAccount {
    */
   checkedInToday?: boolean
   /**
+   * Whether this account's streak tiers were redeemed/settled today (issue #286).
+   * ABSENT means the growth job has not covered this account today.
+   */
+  growthRedeemedToday?: boolean
+  /**
+   * Whether this account was lit "active today" by the job (issue #286).
+   * ABSENT means the growth job has not covered this account today.
+   */
+  growthActiveToday?: boolean
+  /**
    * Promotional benefits this account can STILL claim (issue #79).
    *
    * Never carries a claimed or lapsed campaign: the issue's rule is that those
@@ -2078,6 +2175,20 @@ export interface WorkBuddyWebAutoCheckinToday {
   /** Why the last attempt failed, when it did. */
   lastError?: string
 }
+/**
+ * Today's progress for one growth background job (issue #286).
+ *
+ * Deliberately NOT the check-in shape: growth has no retry/backoff semantics.
+ * An account attempted today is settled whether it redeemed, was already done,
+ * or was unreachable, so there is no `pending`/`lastError` to show — just a
+ * stable "已兑换 / 已点亮 X / Y" count the user asked for.
+ */
+export interface WorkBuddyWebGrowthToday {
+  /** Accounts settled today (attempted, redeemed, or already done). */
+  done: number
+  /** Accounts in scope today — the real pool member count. */
+  total: number
+}
 export interface WorkBuddyWebPool {
   enabled: boolean
   /**
@@ -2096,6 +2207,10 @@ export interface WorkBuddyWebPool {
    * runner happens to be doing with the previous value.
    */
   autoCheckin?: boolean
+  /** Auto-redeem claimable growth-tiers (issue #286). Absent means OFF. */
+  growthRedeem?: boolean
+  /** Auto-light "active today" via ACP (issue #286). Absent means OFF. */
+  growthActivity?: boolean
   /**
    * What the automatic check-in has done today, when it is switched on.
    *
@@ -2106,6 +2221,10 @@ export interface WorkBuddyWebPool {
    * settled, and asking it to guess is how the count would drift from the truth.
    */
   autoCheckinToday?: WorkBuddyWebAutoCheckinToday
+  /** Today's streak-redeem progress, when that switch is on and the job ran. */
+  growthRedeemToday?: WorkBuddyWebGrowthToday
+  /** Today's active-today progress, when that switch is on and the job ran. */
+  growthActivityToday?: WorkBuddyWebGrowthToday
   /** The model a test would use right now; absent when none can be resolved. */
   targetModelId?: string
   /**

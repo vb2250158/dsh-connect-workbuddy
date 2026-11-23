@@ -58,6 +58,10 @@ export const en = {
   // with a rescan that looks like it worked.
   'row.rescanHidesKept': 'The accounts you removed are still hidden: the plugin could not update its own list file. On Windows this is usually a file lock — close antivirus or sync tools that may be holding files in the DSH profile, then try again.',
   'row.credentialRejectedTitle': 'WorkBuddy refused this account\'s token',
+  // Headline for a token that was refused during REFRESH (issue #285), when the
+  // region stays signed-out but its accounts are still on disk. The dedicated
+  // refusal block below carries the switch/re-login advice.
+  'row.credentialRejectedNotice': 'The signed-in token was refused by WorkBuddy, but your local accounts are still present — see the recovery options below.',
   'row.credentialRejectedIntro': 'The token for "{accountName}" is no longer accepted by the upstream, so credits and check-in are unavailable. Signing in again only helps if the problem is the token itself — here is what actually applies:',
   'row.credentialRejectedSwitch': 'Another sign-in on this machine answered the upstream: "{accountName}". Switching to it fixes this — no need to sign in again.',
   'row.credentialRejectedSwitchAction': 'Switch to "{accountName}"',
@@ -151,6 +155,24 @@ export const en = {
   // a static "expand or collapse" would make the reader work out which applies.
   'row.modelsRefresh': 'Refresh from WorkBuddy',
   'row.modelsRefreshing': 'Refreshing models…',
+  // THE DIRECTORY IS A PARTIAL ANSWER (issue #288). One of the two product
+  // documents the international region reads was refused — a rate limit, a
+  // transport error — and the other one answered, so the list on screen is
+  // missing rows the upstream does publish. Without this notice a rate limit
+  // looked exactly like "the upstream only offers this one model", and the
+  // user could not tell which of the two they were looking at.
+  'row.catalogDegraded': 'Model directory degraded: the {missing} read failed ({reason}). This list comes from the {used} directory, so it may be incomplete.',
+  // The upstream states its recovery time in prose, so this is the only place
+  // the user learns when the limit lifts. Absent when the upstream named no
+  // time — the plugin never invents one.
+  'row.catalogDegradedReset': 'The upstream says it recovers at {at}.',
+  // Which rows are from the saved snapshot rather than from this read. They
+  // are the upstream's offer — the refused document still publishes them — so
+  // they are kept, and named, instead of quietly vanishing.
+  'row.catalogDegradedCarried': 'Not returned by this read, still from the saved directory: {models}.',
+  'row.catalogSourceApp': 'the app channel',
+  'row.catalogSourceCli': 'the CLI channel',
+  'row.catalogSourceLegacy': 'the legacy directory',
   'row.discard': 'Discard changes',
   'row.save': 'Save',
   'row.saving': 'Saving…',
@@ -410,6 +432,35 @@ export const en = {
   // does not tell a user that a background job will write to their account.
   'row.poolAutoCheckin': 'Check in automatically each day',
   'row.poolAutoCheckinHint': 'On: the plugin claims the daily check-in for the accounts checked into this pool, once a day, in the background. It reads first and never re-claims an account already checked in, so a restart cannot double-claim. Off: nothing runs until you press the button. A missed day resets the streak.',
+  // Growth center (issue #286) — both switches opt-in, both regions.
+  'row.poolGrowthRedeem': 'Redeem growth rewards automatically',
+  'row.poolGrowthRedeemHint': 'On: once a day the plugin redeems any streak tier the gateway marks available, for each pooled account. Locked tiers are skipped, so repeat runs write nothing. Available in both regions.',
+  'row.poolGrowthArmed': 'Enabled — the first run will start shortly; progress shows here.',
+  'row.poolGrowthRedeemToday': 'Redeemed: {done} of {total} today',
+  'row.poolGrowthRedeemDone': 'Redeemed: all {total} today',
+  'row.poolGrowthActivity': 'Light up "active today" automatically',
+  'row.poolGrowthActivityHint': 'On: once a day the plugin sends ONE short chat turn per pooled account through the console session, which lights up "active today". This spends a little credit. Accounts already active get no turn. Available in both regions.',
+  'row.poolGrowthActivityToday': 'Active today: {done} of {total}',
+  'row.poolGrowthActivityDone': 'Active today: all {total}',
+  // Per-account stamps on the row (issue #286), sibling of 已签到.
+  'row.poolGrowthRedeemed': 'Redeemed',
+  'row.poolGrowthActive': 'Activated',
+  // Manual "run now" buttons + log lines (issue #286).
+  'row.poolGrowthRedeemRun': 'Redeem selected accounts',
+  'row.poolGrowthRedeemRunning': 'Redeeming…',
+  'row.poolGrowthRedeemRunHint': 'Redeem available streak tiers for every checked account now, regardless of the automatic switch.',
+  'row.poolGrowthActivityRun': 'Activate selected accounts',
+  'row.poolGrowthActivityRunning': 'Activating…',
+  'row.poolGrowthActivityRunHint': 'Light up "active today" for every checked account now. Sends one short chat turn per active account and spends a little credit.',
+  'row.poolLogGrowthRedeemStart': 'Redeeming growth tiers for {count} account(s)…',
+  'row.poolLogGrowthActivityStart': 'Lighting up "active today" for {count} account(s)…',
+  'row.poolLogGrowthRedeemDone': '{accountName}: redeemed{credit}',
+  'row.poolLogGrowthActivityDone': '{accountName}: active today',
+  'row.poolLogGrowthAlready': '{accountName}: already done, skipped',
+  'row.poolLogGrowthSkipped': '{accountName}: nothing to do, skipped',
+  'row.poolLogGrowthFailed': '{accountName}: failed — {message}',
+  'row.poolLogGrowthRedeemBatchDone': 'Growth redeem finished',
+  'row.poolLogGrowthActivityBatchDone': 'Active-today run finished',
   'row.poolAutoCheckinToday': 'Today: {done} of {total} checked in',
   'row.poolAutoCheckinDone': 'Today: all {total} checked in',
   'row.poolAutoCheckinPending': '{count} still to retry',
@@ -735,6 +786,11 @@ export const en = {
   'composer.creditSoonHint': 'Earliest expiry: {time}',
   'composer.noAccounts': 'No account in this region',
   'composer.signedOut': 'Not signed in',
+  // Issue #285: the selected token was refused by the upstream, but the local
+  // accounts are still present (the export dialog can see them). The panel
+  // shows them; these two lines say why the balances are blank and what helps.
+  'composer.credentialRejectedReLogin': 'The signed-in token was refused by WorkBuddy. Sign in again in the desktop app.',
+  'composer.credentialRejectedSwitch': 'The signed-in token was refused by WorkBuddy. Switch to "{accountName}" below to recover.',
   // The panel's link to this plugin's OWN settings. Kept SHORT ("Settings", not
   // "WorkBuddy settings"): the popover is ~250px wide and the header already
   // carries the region title and the batch test, so a longer label wrapped the
@@ -833,6 +889,9 @@ export const zh: Record<WorkBuddySettingsKey, string> = {
   // 说明发生了什么、该做什么，而不是让用户以为「重新检测」成功了。
   'row.rescanHidesKept': '已删除的账号仍是隐藏状态：插件没能更新自己的名单文件。Windows 上通常是文件被占用——请关闭可能正在占用 DSH 配置目录的杀毒/同步工具后重试。',
   'row.credentialRejectedTitle': 'WorkBuddy 拒绝了这个账号的 token',
+  // 刷新 token 时被上游拒绝的 headline（issue #285）：区域仍未登录，但账号还在
+  // 本机。下面专门的拒绝块负责给出切换/重新登录的解决办法。
+  'row.credentialRejectedNotice': '当前登录的 token 被 WorkBuddy 拒绝，但本机账号仍在——请按下方的恢复提示处理。',
   'row.credentialRejectedIntro': '「{accountName}」的 token 已不被上游接受，所以积分与签到都用不了。重新登录只在「确实是 token 的问题」时才有用——当前实际适用的是下面这一条：',
   'row.credentialRejectedSwitch': '本机另一个账号「{accountName}」刚刚实测可用，切换到它即可恢复，不必重新登录。',
   'row.credentialRejectedSwitchAction': '切换到「{accountName}」',
@@ -900,6 +959,19 @@ export const zh: Record<WorkBuddySettingsKey, string> = {
   // 而不是区块的标签——写成固定的「展开或收起」会让读者自己去想该按哪个。
   'row.modelsRefresh': '从 WorkBuddy 刷新',
   'row.modelsRefreshing': '正在刷新模型…',
+  // 目录是「残缺回答」（issue #288）。国际区读的两份产品文档里有一份被拒（限流、
+  // 网络错误），另一份答了，于是屏幕上的列表少了上游确实在提供的行。没有这行提示
+  // 时，限流看起来和「上游只给这一个模型」一模一样，用户无从分辨自己在看哪一种。
+  'row.catalogDegraded': '模型目录降级：{missing}读取失败（{reason}）。当前列表来自{used}，可能不完整。',
+  // 恢复时间由上游写在报文里，所以这是用户唯一能看到「什么时候解禁」的地方。上游
+  // 没给时间时就不显示——插件从不编一个时间出来。
+  'row.catalogDegradedReset': '上游给出的恢复时间：{at}。',
+  // 哪些行来自上次保存的目录。它们仍是上游的目录（被拒的那份文档照样发布它们），
+  // 所以保留并点名，而不是悄悄消失。
+  'row.catalogDegradedCarried': '本次没读到、仍来自已保存目录的模型：{models}。',
+  'row.catalogSourceApp': '应用通道',
+  'row.catalogSourceCli': 'CLI 通道',
+  'row.catalogSourceLegacy': '旧版目录',
   'row.discard': '放弃修改',
   'row.save': '保存',
   'row.saving': '保存中…',
@@ -1150,6 +1222,34 @@ export const zh: Record<WorkBuddySettingsKey, string> = {
   // 自动签到（issue #191）。默认关，且标题写的是「它会做什么」而不是功能名。
   'row.poolAutoCheckin': '每天自动签到',
   'row.poolAutoCheckinHint': '开启：插件在后台为勾选进池的账号领取每日签到，一天一次。它先读状态、已签到的不重复领取，所以重启也不会多领。关闭：不点按钮就什么都不会发生。漏一天会断连签。',
+  // 成长中心（issue #286）：两个开关均默认关闭，两个区都可用。
+  'row.poolGrowthRedeem': '自动兑换成长奖励',
+  'row.poolGrowthRedeemHint': '开启：插件每天为池内每个账号兑换上游标记为可领的连签档位，已锁的档位跳过，因此重复运行不会重复写。国内版与国际版均可用。',
+  'row.poolGrowthArmed': '已开启——即将首次运行，进度会显示在这里。',
+  'row.poolGrowthRedeemToday': '已兑换 {done} / {total}',
+  'row.poolGrowthRedeemDone': '已兑换 全部 {total}',
+  'row.poolGrowthActivity': '自动点亮「今日活跃」',
+  'row.poolGrowthActivityHint': '开启：插件每天通过控制台会话为池内每个账号发一条简短对话，点亮「今日活跃」。这会消耗少量积分；今日已活跃的账号不会发。国内版与国际版均可用。',
+  'row.poolGrowthActivityToday': '已点亮 {done} / {total}',
+  'row.poolGrowthActivityDone': '已点亮 全部 {total}',
+  'row.poolGrowthRedeemed': '已兑换',
+  'row.poolGrowthActive': '已点亮',
+  // 手动「立即执行」按钮与日志（issue #286）。
+  'row.poolGrowthRedeemRun': '兑换勾选的账号',
+  'row.poolGrowthRedeemRunning': '兑换中…',
+  'row.poolGrowthRedeemRunHint': '立即为勾选的每个账号兑换可领的连签档位，不受自动开关影响。',
+  'row.poolGrowthActivityRun': '点亮勾选的账号',
+  'row.poolGrowthActivityRunning': '点亮中…',
+  'row.poolGrowthActivityRunHint': '立即为勾选的账号点亮「今日活跃」，每个账号发一条简短对话，消耗少量积分。',
+  'row.poolLogGrowthRedeemStart': '正在为 {count} 个账号兑换成长档位…',
+  'row.poolLogGrowthActivityStart': '正在为 {count} 个账号点亮「今日活跃」…',
+  'row.poolLogGrowthRedeemDone': '{accountName}：已兑换{credit}',
+  'row.poolLogGrowthActivityDone': '{accountName}：今日已活跃',
+  'row.poolLogGrowthAlready': '{accountName}：今日已处理，跳过',
+  'row.poolLogGrowthSkipped': '{accountName}：无可处理项，跳过',
+  'row.poolLogGrowthFailed': '{accountName}：失败 — {message}',
+  'row.poolLogGrowthRedeemBatchDone': '成长档位兑换完成',
+  'row.poolLogGrowthActivityBatchDone': '今日活跃点亮完成',
   'row.poolAutoCheckinToday': '今日：已签 {done} / {total}',
   'row.poolAutoCheckinDone': '今日：{total} 个全部已签',
   'row.poolAutoCheckinPending': '待重试 {count} 个',
@@ -1446,6 +1546,10 @@ export const zh: Record<WorkBuddySettingsKey, string> = {
   'composer.creditSoonHint': '最早到期：{time}',
   'composer.noAccounts': '该区域暂无账号',
   'composer.signedOut': '未登录',
+  // issue #285：选中的 token 被上游拒绝，但本机账号还在（导出对话框能看到）。
+  // 面板会把账号列出来，这两行说明余额为什么是空的、以及该怎么做。
+  'composer.credentialRejectedReLogin': '当前登录的 token 被 WorkBuddy 拒绝，请在桌面端重新登录。',
+  'composer.credentialRejectedSwitch': '当前登录的 token 被 WorkBuddy 拒绝，可在下方切换到「{accountName}」恢复。',
   // 面板里通往本插件自身页面的入口。措辞取短（「设置」而不是「WorkBuddy 设置」）：
   // 这个浮层只有约 250px 宽，头部还要放区域标题和一键测试，长标签会把标题挤成
   // 两行。面板本身就只属于这个插件，去处由 tooltip 说明，短词不丢信息。

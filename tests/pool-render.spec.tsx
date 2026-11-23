@@ -16,6 +16,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AccountPool } from '../src/client/AccountPool.tsx'
+import { en, zh } from '../src/client/locales.ts'
 import { accountOf, fakeScope, mount, poolOf, stubFetch, t } from './pool-render-helpers.tsx'
 
 afterEach(() => { vi.unstubAllGlobals() })
@@ -1601,11 +1602,15 @@ describe('the mode bar draws both switches the same way', () => {
     })
   }
 
-  it('renders two switches, and both use the same internal markup', async () => {
+  it('renders the pool + check-in switches, and every switch uses the same markup', async () => {
     stubFetch(() => ({ body: {} }))
     const m = await mount(AccountPool, bothSwitches())
     const switches = Array.from(m.container.querySelectorAll('.dsm-workbuddy-pool .sw'))
-    expect(switches, 'the pool switch AND the check-in switch').toHaveLength(2)
+    // Pool + check-in, plus the two opt-in growth switches (issue #286). The
+    // invariant that matters is not the exact count but the SHARED SHAPE below:
+    // every switch is a label.sw holding input + track, so none renders at the
+    // host default size. Pin a minimum of 2 so the original pair is always here.
+    expect(switches.length, 'the pool switch AND the check-in switch').toBeGreaterThanOrEqual(2)
     for (const sw of switches) {
       // The shared shape is what makes them look alike: a hidden checkbox plus
       // the styled track. A second switch drawn with a bare <input> would have
@@ -1622,6 +1627,88 @@ describe('the mode bar draws both switches the same way', () => {
       expect(sw.children[0]?.tagName).toBe('INPUT')
       expect(sw.children[1]?.className).toBe('sw-track')
     }
+    await m.unmount()
+  })
+
+  it('renders manual "run now" buttons for both growth jobs (issue #286)', async () => {
+    stubFetch(() => ({ body: {} }))
+    const m = await mount(AccountPool, baseProps())
+    expect(m.button('row.poolGrowthRedeemRun'), 'redeem-now button present').toBeDefined()
+    expect(m.button('row.poolGrowthActivityRun'), 'activate-now button present').toBeDefined()
+    // The buttons act on CHECKED accounts, so their labels must say so — same
+    // as 签到勾选的账号 / 测试勾选的账号 beside them.
+    expect(zh['row.poolGrowthRedeemRun']).toContain('勾选')
+    expect(zh['row.poolGrowthActivityRun']).toContain('勾选')
+    expect(en['row.poolGrowthRedeemRun']).toContain('selected')
+    expect(en['row.poolGrowthActivityRun']).toContain('selected')
+    await m.unmount()
+  })
+
+  it('shows per-account 已兑换/已点亮 stamps, NOT an aggregate X/Y count (issue #286)', async () => {
+    // The user rejected the top "已兑换 8/17 / 已点亮 8/9" summary. They want
+    // the same stable per-row stamp the check-in column uses: 已签到 / 已兑换 /
+    // 已点亮. So the status lives on the account row, not under the switch.
+    stubFetch(() => ({ body: {} }))
+    const m = await mount(AccountPool, baseProps({
+      pool: poolOf({
+        memberAccountIds: [GENUINE_ID],
+        effectiveMemberAccountIds: [GENUINE_ID],
+        accounts: [accountOf({ ...GENUINE_ACCOUNT, growthRedeemedToday: true, growthActiveToday: true })],
+        growthRedeem: true,
+        growthActivity: true,
+        // Even if a stale aggregate status is present, it must NOT be rendered.
+        growthRedeemToday: { done: 1, total: 9 },
+        growthActivityToday: { done: 1, total: 9 },
+      }),
+    }))
+    // All three stamps live together in ONE compact group INSIDE the credits
+    // cell, not three separate spans on the account line.
+    const group = m.container.querySelector('.dsm-workbuddy-pool-credits .dsm-workbuddy-pool-daystamps')
+    expect(group, 'a compact stamp group sits inside the credits cell').not.toBeNull()
+    const stamps = Array.from(group?.querySelectorAll('.dsm-workbuddy-pool-daystamp') ?? [])
+    expect(stamps.length, 'three stamps').toBe(3)
+    // Icons, not text: each is an svg with a title tooltip + aria-label instead
+    // of a visible 已签到/已兑换/已点亮 label.
+    expect(group?.textContent?.trim(), 'no visible text in the stamp group').toBe('')
+    expect(stamps.every(s => s.querySelector('svg') !== null), 'each stamp is an svg icon').toBe(true)
+    const tips = stamps.map(s => s.getAttribute('title'))
+    expect(tips).toEqual(['row.poolCheckedIn', 'row.poolGrowthRedeemed', 'row.poolGrowthActive'])
+    expect(m.container.textContent, 'no aggregate fraction').not.toContain('row.poolGrowthRedeemToday')
+    expect(m.container.querySelector('.dsm-workbuddy-pool-auto-checkin-status'), 'no status bar under switch').toBeNull()
+    await m.unmount()
+  })
+
+  it('shows no growth stamp for an account the job has not touched', async () => {
+    stubFetch(() => ({ body: {} }))
+    const m = await mount(AccountPool, baseProps({
+      pool: poolOf({
+        memberAccountIds: [GENUINE_ID],
+        effectiveMemberAccountIds: [GENUINE_ID],
+        accounts: [GENUINE_ACCOUNT],
+        growthRedeem: true,
+      }),
+    }))
+    expect(m.container.textContent).not.toContain('row.poolGrowthRedeemed')
+    expect(m.container.textContent).not.toContain('row.poolGrowthActive')
+    await m.unmount()
+  })
+
+  it('clicking the two growth switches updates the draft without throwing (issue #286)', async () => {
+    // Regression for a real crash: reading `event.currentTarget.checked` INSIDE
+    // the queued editDraft updater throws "Cannot read properties of null
+    // (reading 'checked')" — React nulls currentTarget after the handler returns.
+    // Both switches must capture the value synchronously, like the check-in one.
+    stubFetch(() => ({ body: {} }))
+    const m = await mount(AccountPool, bothSwitches())
+    const growthBlocks = m.container.querySelectorAll('.dsm-workbuddy-pool-auto-checkin')
+    const growth = growthBlocks[growthBlocks.length - 1]
+    expect(growth, 'the growth switch block renders').not.toBeNull()
+    const boxes = Array.from(growth!.querySelectorAll<HTMLInputElement>('input[type=checkbox]'))
+    expect(boxes.length, 'two growth switches').toBe(2)
+    for (const box of boxes) {
+      await expect(m.click(box)).resolves.toBeUndefined()
+    }
+    expect(m.button('row.poolSaved').disabled, 'clicking them dirtied the draft').toBe(false)
     await m.unmount()
   })
 

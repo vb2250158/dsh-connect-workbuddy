@@ -41,6 +41,7 @@ import { Config, unwrapVolatileDeep } from './index.ts'
 import type { WorkBuddyRecoveryCandidate } from './credential-recovery.ts'
 import type { WorkBuddyMediaModel } from './image-gen.ts'
 import type { WorkBuddyCredits, WorkBuddyUpstreamClient } from './upstream.ts'
+import type { WorkBuddyCatalogDegradation, WorkBuddyCatalogRead } from './upstream.ts'
 import type { WorkBuddyBenefitView } from './benefits.ts'
 import { WORKBUDDY_BENEFIT_TITLES } from './benefits.ts'
 import { isCredentialRejectedError } from './upstream.ts'
@@ -52,6 +53,7 @@ import type {
 } from './account-pool-run.ts'
 import { fastDetailOf, regionOfStatusUrl, regionsMapOf, transferActionOf } from './status-paths.ts'
 import type { WorkBuddyCreditPosition } from './status-paths.ts'
+import { toWebCatalogDegradation } from './status-paths.ts'
 import type { RosterSeenReadout } from './roster-seen-store.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 import {
@@ -85,12 +87,14 @@ import type {
   WorkBuddyWebAccount,
   WorkBuddyWebAccountCredit,
   WorkBuddyWebAutoCheckinToday,
+  WorkBuddyWebGrowthToday,
   WorkBuddyWebCredits,
   WorkBuddyWebPool,
   WorkBuddyWebPoolAccount,
   WorkBuddyWebPoolExclusion,
   WorkBuddyWebProbeOutcome,
   WorkBuddyWebProbeResult,
+  WorkBuddyWebRecovery,
   WorkBuddyWebTpsAnswer,
   WorkBuddyWebTpsResult,
   WorkBuddyWebSearchPath,
@@ -140,7 +144,7 @@ export interface WorkBuddyStatusRouteOptions {
    */
   defaultThinkingEfforts?(region: WorkBuddyRegion): Readonly<Record<string, string | undefined>>
   /** Re-read the live catalog of one region from the upstream. */
-  discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>
+  discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<WorkBuddyCatalogRead>
   /**
    * Record what a refresh just read, so the directory — and therefore every
    * price on it — stops being a snapshot of an older day (issue #214).
@@ -165,7 +169,16 @@ export interface WorkBuddyStatusRouteOptions {
    * paints its draft from the ANSWER, so a 503 leaves the draft untouched and
    * the user sees a real error instead of a stale list that looks refreshed.
    */
-  persistModels?(region: WorkBuddyRegion, models: readonly WorkBuddyModelInfo[]): Promise<void>
+  persistModels?(region: WorkBuddyRegion, read: WorkBuddyCatalogRead): Promise<void>
+  /**
+   * Whether the requested region's model directory is a PARTIAL answer
+   * (issue #288) — one product document was refused and the other one
+   * answered, so the list is missing rows the upstream does publish.
+   *
+   * Optional: absent means the Host does not track the fact, and the card
+   * shows no notice rather than inventing one.
+   */
+  catalogDegradation?(region: WorkBuddyRegion): WorkBuddyCatalogDegradation | undefined
   /**
    * Which ids of the requested region's roster THIS machine first saw inside the
    * new-model window (the "· N 新模型" segment), plus a note when the on-disk
@@ -583,6 +596,10 @@ export interface WorkBuddyPoolDeps {
      * profile until someone ticks it.
      */
     autoCheckin?: boolean
+    /** Auto-redeem claimable streak tiers (issue #286, opt-in, both regions). */
+    growthRedeem?: boolean
+    /** Auto-light "active today" via ACP (issue #286, opt-in, both regions). */
+    growthActivity?: boolean
   }
   /** One region's CHECKED accounts, plus their credits and last measurements. */
   members(region: WorkBuddyRegion): Promise<readonly WorkBuddyPoolMember[]>
@@ -654,12 +671,21 @@ export interface WorkBuddyPoolDeps {
    * Today's check-in state, from the cells already measured this process.
    *
    * The first-paint counterpart of {@link checkedInToday}: reads the Host's
-   * measurement cache and nothing else, so a first paint never waits on one
-   * upstream request per account. An account it has not measured is simply
+   * local done-today memory and nothing else, so a first paint never waits on
+   * one upstream request per account. An account it has not measured is simply
    * absent, which the card renders as unknown — the same meaning as a failed
    * per-account read in the full document.
    */
-  cachedCheckedInToday?(region: WorkBuddyRegion): Readonly<Record<string, boolean>>
+  cachedCheckedInToday?(region: WorkBuddyRegion): Promise<Readonly<Record<string, boolean>>> | Readonly<Record<string, boolean>>
+  /**
+   * Per-account growth completion for today (issue #286), from the runner's own
+   * day state — no upstream read. `true` only for accounts the job settled today;
+   * absent for accounts it has not covered. Drives the per-row 已兑换/已点亮 stamp.
+   */
+  growthDoneAccountIds?(
+    region: WorkBuddyRegion,
+    cap: 'growth-redeem' | 'growth-activity',
+  ): Promise<Readonly<Record<string, boolean>>> | Readonly<Record<string, boolean>>
   /**
    * Claimable promotional benefits per account id (issue #79).
    *
@@ -719,6 +745,13 @@ export interface WorkBuddyPoolDeps {
    */
   checkin?(region: WorkBuddyRegion): Promise<readonly WorkBuddyPoolCheckinRow[]>
   /**
+   * Manually run one growth job for every pooled account (issue #286). These are
+   * the on-demand equivalents of the two opt-in background switches. Absent
+   * means the action answers 503. The row shape is shared with the check-in
+   * batch (`done`/`skipped`/`failed` plus a message).
+   */
+  growthRun?(region: WorkBuddyRegion, action: 'growth-redeem' | 'growth-activity'): Promise<readonly WorkBuddyPoolCheckinRow[]>
+  /**
    * What the automatic check-in has settled today, when it is switched on
    * (issue #191).
    *
@@ -732,6 +765,10 @@ export interface WorkBuddyPoolDeps {
    * happened.
    */
   autoCheckinToday?(region: WorkBuddyRegion): WorkBuddyWebAutoCheckinToday | undefined
+  /** Today's streak-redeem progress (issue #286), from the runner's own state. */
+  growthRedeemToday?(region: WorkBuddyRegion): WorkBuddyWebGrowthToday | undefined
+  /** Today's active-today progress (issue #286), from the runner's own state. */
+  growthActivityToday?(region: WorkBuddyRegion): WorkBuddyWebGrowthToday | undefined
   /**
    * Test every account of one region against the resolved target model.
    *
@@ -1223,6 +1260,32 @@ type WorkBuddyLiveFigures = Pick<
 >
 
 /**
+ * Decide what the user can do about a refused credential in one region.
+ *
+ * Shared by the two refusal paths: a credits/check-in read that was rejected
+ * on an otherwise usable credential ({@link liveFigures}), and a `resolve()`
+ * whose TOKEN REFRESH was rejected outright (issue #285 — the CN card hid all
+ * of its accounts while the export dialog still saw them). The recovery answer
+ * must not depend on which path noticed the refusal: both offer the same
+ * "switch to a verified account / sign in again" advice.
+ */
+async function credentialRecoveryOf(
+  deps: WorkBuddyStatusRouteOptions,
+  region: WorkBuddyRegion,
+  rejectedAccountId: string | undefined,
+): Promise<WorkBuddyWebRecovery> {
+  return resolveCredentialRecovery({
+    region,
+    store: deps.store(region),
+    ...rejectedAccountId === undefined ? {} : { rejectedAccountId },
+    // Without an injected probe nothing can be verified, so no account is
+    // claimed usable — `reloginRequired` then still reports the one case that
+    // needs no probe (there is nothing else to switch to).
+    probe: deps.accountUsable ?? (async () => false),
+  })
+}
+
+/**
  * Read the selected account's live figures, and classify a refusal.
  *
  * Extracted so the first-paint path can omit it as a unit: the two calls here
@@ -1246,15 +1309,7 @@ async function liveFigures(
   const rejected = [creditsResult, checkinResult].some(
     result => result.status === 'rejected' && isCredentialRejectedError(result.reason),
   )
-  const recovery = !rejected ? undefined : await resolveCredentialRecovery({
-    region,
-    store: deps.store(region),
-    ...selected === undefined ? {} : { rejectedAccountId: selected.id },
-    // Without an injected probe nothing can be verified, so no account is
-    // claimed usable — `reloginRequired` then still reports the one case that
-    // needs no probe (there is nothing else to switch to).
-    probe: deps.accountUsable ?? (async () => false),
-  })
+  const recovery = !rejected ? undefined : await credentialRecoveryOf(deps, region, selected?.id)
   return {
     ...creditsResult.status === 'fulfilled'
       ? { credits: toCredits(creditsResult.value) }
@@ -1351,6 +1406,13 @@ export async function workBuddyWebStatus(
   // The LIVE load levels, beside the model list rather than inside it: the
   // card's list is the SAVED roster, and a saved roster has no load level.
   const busyLevels = deps.busyLevels?.(region) ?? {}
+  // Whether the model directory is a PARTIAL answer (issue #288): one product
+  // document was refused and the other one answered. The card shows it as a
+  // notice, so the user can tell a short directory from a failed read.
+  const catalogDegraded = (() => {
+    const degradation = deps.catalogDegradation?.(region)
+    return degradation === undefined ? undefined : toWebCatalogDegradation(degradation)
+  })()
   const authStatus = await store.status()
   // Whether a saved per-region choice is in effect, on every branch: the card
   // needs it to show that clearing really did return the region to the app's
@@ -1385,10 +1447,26 @@ export async function workBuddyWebStatus(
     // saved id (the tokens here are fine — re-pick or clear) versus a genuinely
     // signed-out machine (the "sign in again" hint is then accurate).
     const webAccounts = accounts.map(toWebAccount)
+    // Issue #285: a TOKEN REFRESH rejected upstream used to be wrapped in an
+    // ordinary "sign in again" Error, so this branch reported the whole region
+    // as signed-out and the card hid `webAccounts` — even though the export
+    // dialog could list them and the desktop app was signed in. Now that the
+    // store re-throws a credential refusal with its marker intact, classify it
+    // here exactly as `liveFigures` classifies a refused credits read: keep
+    // the accounts on the document AND carry the actionable recovery advice.
+    // The card renders both its signed-out notice and the credential-refused
+    // block from these fields, so the user sees the real fix instead of a
+    // blank "未登录" (also in the model picker).
+    const refreshRejected = isCredentialRejectedError(error)
+    const recovery = !refreshRejected ? undefined : await credentialRecoveryOf(
+      deps, region, accounts.find(account => account.selected)?.id,
+    )
     return {
       status: 'signed-out',
       accounts: webAccounts,
       message: safeMessage(error),
+      ...!refreshRejected ? {} : { credentialRejected: true },
+      ...recovery === undefined ? {} : { recovery },
       selectionExplicit,
       enabled,
       showCreditsInMainUi,
@@ -1461,6 +1539,11 @@ export async function workBuddyWebStatus(
     enabledModelIds: [...deps.enabledModelIds(region)],
     imageModelIds: [...deps.imageModelIds(region)],
     offModelIds: [...deps.offModelIds(region)],
+    // The directory is a PARTIAL answer when one product document was refused
+    // (issue #288). Carried so the card can tell "the upstream only offers one
+    // model" apart from "the upstream could not be read, and this is what
+    // survived" — on screen the two look identical otherwise.
+    ...catalogDegraded === undefined ? {} : { catalogDegraded },
   }
   // The first paint carries no live figures at all: this is the await that used
   // to make the account list wait on a billing endpoint (issue #77).
@@ -1585,9 +1668,13 @@ async function workBuddyWebPool(
   // already-measured cells only (no per-account request), so it can report
   // nothing at all; the full document fills the column in later.
   const checkedIn: Readonly<Record<string, boolean>> = fast
-    ? pool.cachedCheckedInToday?.(region) ?? {}
+    ? await pool.cachedCheckedInToday?.(region) ?? {}
     : await pool.checkedInToday?.(region).catch(() => ({} as Record<string, boolean>))
       ?? {} as Record<string, boolean>
+  // Growth completion is runner state, not an upstream read — cheap in both the
+  // fast first paint and the full document (issue #286).
+  const growthRedeemed = await pool.growthDoneAccountIds?.(region, 'growth-redeem') ?? {}
+  const growthActive = await pool.growthDoneAccountIds?.(region, 'growth-activity') ?? {}
   // Claimable benefits per account (issue #79). Read the same two ways as the
   // check-in column: the first paint uses this process's readings (no request),
   // the full document pays for two status calls per account. A failed or absent
@@ -1666,6 +1753,8 @@ async function workBuddyWebPool(
       current: account.id === currentAccountId,
       member,
       ...checkedIn[account.id] === undefined ? {} : { checkedInToday: checkedIn[account.id] as boolean },
+      ...growthRedeemed[account.id] === true ? { growthRedeemedToday: true } : {},
+      ...growthActive[account.id] === true ? { growthActiveToday: true } : {},
       ...(() => {
         // Only campaigns that can still be claimed survive this map; a claimed
         // or lapsed one never reaches the card at all (issue #79). The title is
@@ -1695,12 +1784,22 @@ async function workBuddyWebPool(
     // draft-and-save cycle must show what is stored. Absent reads as OFF, which
     // is the truth for every profile until someone ticks it.
     ...preferences.autoCheckin !== true ? {} : { autoCheckin: true },
+    ...preferences.growthRedeem !== true ? {} : { growthRedeem: true },
+    ...preferences.growthActivity !== true ? {} : { growthActivity: true },
     // Only when the runner has something to say. An object full of zeroes would
     // make "nothing has run" indistinguishable from "ran and found nothing to
     // do", and the card renders those differently.
     ...(() => {
       const today = pool.autoCheckinToday?.(region)
       return today === undefined ? {} : { autoCheckinToday: today }
+    })(),
+    ...(() => {
+      const today = pool.growthRedeemToday?.(region)
+      return today === undefined ? {} : { growthRedeemToday: today }
+    })(),
+    ...(() => {
+      const today = pool.growthActivityToday?.(region)
+      return today === undefined ? {} : { growthActivityToday: today }
     })(),
     ...target.modelId === undefined ? {} : { targetModelId: target.modelId },
     ...target.staleModelId === undefined ? {} : { staleTargetModelId: target.staleModelId },
@@ -1923,13 +2022,23 @@ export function registerWorkBuddyStatusRoute(ctx: Context, deps: WorkBuddyStatus
           ? (json(res, 503, { error: 'model refresh cannot be persisted' }), false)
           : true,
     }, async (_req, res, region) => {
-      const models = await deps.discoverModels!(region)
+      const read = await deps.discoverModels!(region)
       // Persist BEFORE answering: the write is what the caller's next read
       // depends on, and a failure must surface as a failure. Only the DIRECTORY
       // is written (`persistModels` owns the merge); the user's selection is the
       // card's draft until they press Save.
-      await deps.persistModels!(region, models)
-      json(res, 200, { models: models.map(model => toWebModel(model, deps.contextBudgets(region))) })
+      await deps.persistModels!(region, read)
+      // The degradation rides along with the answer (issue #288): a refresh
+      // that fell back to the other product document produced a PARTIAL
+      // directory, and the card must not narrow the user's picks to the rows
+      // that survived it. The card keeps the ones the refused document
+      // published and says which they are.
+      json(res, 200, {
+        models: read.models.map(model => toWebModel(model, deps.contextBudgets(region))),
+        ...read.degraded === undefined
+          ? {}
+          : { degraded: toWebCatalogDegradation(read.degraded) },
+      })
     })
     endpointRegion({
       path: WORKBUDDY_MEDIA_MODELS_PATH,
@@ -2120,6 +2229,18 @@ export function registerWorkBuddyStatusRoute(ctx: Context, deps: WorkBuddyStatus
             }
             const rows = await pool.checkin(region)
             return json(res, 200, { action: 'checkin', rows })
+          }
+          if (action === 'growth-redeem' || action === 'growth-activity') {
+            // Manual equivalents of the two opt-in background jobs (issue #286).
+            // NOT gated on the opt-in switches: a manual action is the user
+            // explicitly asking to run it now, so the switch (which governs the
+            // background timer) must not gate it. Membership is still enforced
+            // above — an empty pool runs nothing.
+            if (pool.growthRun === undefined) {
+              return json(res, 503, { reason: 'pool-unavailable', error: 'pool growth action unavailable' })
+            }
+            const rows = await pool.growthRun(region, action)
+            return json(res, 200, { action, rows })
           }
           if (pool.test === undefined) {
             return json(res, 503, { reason: 'pool-unavailable', error: 'pool test unavailable' })

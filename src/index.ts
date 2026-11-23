@@ -38,6 +38,7 @@ import {
   isUnconfiguredFallbackSnapshot,
   repairedCatalog,
   resolveRoster,
+  rosterOfRead,
 } from './catalog-sync.ts'
 import {
   clearRegionAccountSelection,
@@ -100,7 +101,7 @@ import type {
 import { recordBodyReport, type WorkBuddyUsageCounts } from './body-report.ts'
 import { cooldownOf, outcomeOfFailure, probeModel, redactUpstreamText, resolveProbeInputTokens } from './probe.ts'
 import { measureTps } from './tps.ts'
-import type { UpstreamErrorKind } from './upstream.ts'
+import type { UpstreamErrorKind, WorkBuddyCatalogRead } from './upstream.ts'
 import {
   checkinAllAccounts,
   probeUpdatesOf,
@@ -128,16 +129,27 @@ import {
   localDayKey,
   nextDelayMs,
   pendingTargets,
-  checkinReadingFresh,
   todaySummary,
   AUTO_CHECKIN_IDLE_MS,
 } from './auto-checkin.ts'
 import type { AutoCheckinState } from './auto-checkin.ts'
 import { readAutoCheckinState, writeAutoCheckinState } from './auto-checkin-store.ts'
+import { doneTodayMap, isDoneToday, markDoneToday } from './daily-done-store.ts'
+import { activateGrowth } from './growth-acp.ts'
+import {
+  activateGrowthAll,
+  foldGrowthAttempt,
+  growthPendingTargets,
+  growthTodaySummary,
+  redeemGrowthAll,
+} from './growth-run.ts'
+import type { GrowthTarget } from './growth-run.ts'
+import { readGrowthState, writeGrowthState } from './growth-state-store.ts'
+import type { GrowthCapability } from './growth-state-store.ts'
 import { createFileRosterSeenStore } from './roster-seen-store.ts'
 import type { RosterSeenStore } from './roster-seen-store.ts'
 import type { WorkBuddyShim } from './shim.ts'
-import { WorkBuddyUpstreamClient, APP_VERSION, knownRegionOf, regionOf } from './upstream.ts'
+import { WorkBuddyUpstreamClient, APP_VERSION, knownRegionOf, regionOf, growthHostOf } from './upstream.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 import { attachBusyLevels } from './busy.ts'
 import type { WorkBuddyBusyLevel } from './busy.ts'
@@ -175,7 +187,7 @@ export {
 } from './native-modality.ts'
 // Re-exported above for consumers, and imported here because the image-selection
 // seeding (issue #168) is what applies the same table the card pre-ticks with.
-import { imageDefaultFor } from './native-modality.ts'
+import { imageDefaultFor, isRouterModelId } from './native-modality.ts'
 import { defaultOffModelIds, offDefaultFor, lastRefusalFor, recordRefusal, REFUSES_OFF_MODEL_IDS, withEffectiveOff } from './off-thinking.ts'
 export { defaultOffModelIds, offDefaultFor, REFUSES_OFF_MODEL_IDS, withEffectiveOff }
 export {
@@ -309,6 +321,7 @@ import {
   type WorkBuddyWebAccount,
   type WorkBuddyWebCheckin,
   type WorkBuddyWebCredits,
+  type WorkBuddyWebGrowthToday,
   type WorkBuddyWebModel,
   type WorkBuddyWebPackage,
   type WorkBuddyWebPoolExclusion,
@@ -638,6 +651,23 @@ export interface WorkBuddyPoolPreferences {
    * and the runner refuses to start there.
    */
   autoCheckin?: boolean
+  /**
+   * Whether the plugin redeems claimable streak tiers automatically (issue #286).
+   *
+   * OFF by default, like `autoCheckin`: a redeem is a real WRITE on the account.
+   * Unlike check-in it is available in BOTH regions — the growth-streak endpoint
+   * answers `code 0` in each. Only tiers the gateway marks `available` are ever
+   * redeemed, so a repeat run writes nothing.
+   */
+  growthRedeem?: boolean
+  /**
+   * Whether the plugin lights up "active today" through a console ACP session
+   * (issue #286). OFF by default: one short model turn is sent PER account per
+   * day, which spends a little credit. Idempotent — an already-active account
+   * gets no session. Available in BOTH regions; it is the only growth reward the
+   * international gateway still offers.
+   */
+  growthActivity?: boolean
 }
 
 /** Plugin configuration. */
@@ -955,6 +985,8 @@ const poolConfig = z.object({
    * background path spend a request per account per day learning a refusal.
    */
   autoCheckin: z.boolean().default(false).description('Claim the daily check-in automatically for the accounts checked into this pool (opt-in). Idempotent: an account already checked in today is reported, never re-claimed. Only the CN region has a daily check-in.'),
+  growthRedeem: z.boolean().default(false).description('Redeem claimable streak-growth tiers automatically (opt-in, both regions). Only tiers the gateway marks available are written; a locked tier is skipped. Idempotent across repeat runs.'),
+  growthActivity: z.boolean().default(false).description('Light up "active today" via one console ACP session per account per day (opt-in, both regions). Spends a small amount of credit. Idempotent: an already-active account sends no session.'),
   orderAccountIds: z.array(z.string()).default([]).description('The user\'s hand-ordered pool order, as account ids. Independent of membership: an id need not be checked in (it only takes effect once the account is a member), and ids not listed sort last. Separate from memberAccountIds so reordering never conflicts with, or is destroyed by, a membership edit.'),
 })
 
@@ -1804,39 +1836,15 @@ export function apply(ctx: Context, config: Config): void {
   )
 
   /**
-   * How long a check-in reading is reused before asking the upstream again.
-   *
-   * The card polls the usage route every 60 seconds, but "did this account
-   * check in today" changes only when a check-in runs or the day rolls over.
-   * Without a cache, a 10-account pool cost ~14,400 upstream requests a day for
-   * an answer that was almost always identical.
-   */
-  const CHECKIN_CACHE_MS = 10 * 60_000
-
-  /**
-   * Per-region, per-account check-in readings.
-   *
-   * Invalidated by this plugin's own check-in batch (the only writer that can
-   * change the answer during a session), so the user sees their result
-   * immediately instead of waiting out the TTL.
-   *
-   * A reading is ALSO bounded by the local day, not just by the TTL — see
-   * `checkinReadingFresh`. Both readers go through it, because an entry is an
-   * answer to "has this account checked in TODAY" and a `true` read at 23:58
-   * must not be served at 00:08.
-   */
-  const checkinStateCache: Partial<
-    Record<WorkBuddyRegion, Record<string, { checkedIn: boolean, atMs: number }>>
-  > = {}
-
-  /**
    * Per-region, per-account benefit readings (issue #79).
    *
-   * Same shape and same reasoning as `checkinStateCache`: claim state changes
-   * when a human acts on the web page or in the desktop app, not spontaneously,
-   * so a per-poll read of two endpoints per account would be thousands of
-   * requests a day to learn nothing. Coarser than the check-in TTL because a
-   * benefit window is measured in days, not hours.
+   * "Did this account check in today" is NOT cached here any more: it lives in
+   * the persistent done-today memory (`daily-done-store`), so a fact observed
+   * once is never re-read that day — not even after a restart. Benefit claim
+   * state changes when a human acts on the web page or in the desktop app, not
+   * spontaneously, so a per-poll read of two endpoints per account would be
+   * thousands of requests a day to learn nothing. Its window is measured in
+   * days, not hours.
    */
   const benefitStateCache: Partial<
     Record<WorkBuddyRegion, Record<string, {
@@ -2356,7 +2364,7 @@ export function apply(ctx: Context, config: Config): void {
   const discoverModels = async (
     region: WorkBuddyRegion,
     signal?: AbortSignal,
-  ): Promise<readonly WorkBuddyModelInfo[]> => {
+  ): Promise<WorkBuddyCatalogRead> => {
     const credential = await stacks[region].store.resolve()
     // The user's own selection rides along with the refresh. The upstream
     // roster may drop a model the user is running (the app channel's `cli`
@@ -2365,9 +2373,36 @@ export function apply(ctx: Context, config: Config): void {
     // refresh would silently withdraw the model the user is on, which is the
     // exact failure issue #32 was filed for. The document still publishes it
     // and the chat endpoint still answers for it, so it stays in the roster.
+    //
+    // ⚠️ THE KEEP CONTRACT IS PER DOCUMENT (issue #288). The kept ids are
+    // re-added only when the SAME document still publishes them, so a read
+    // that fell back to the other document drops the rows that document does
+    // not carry. That is why the answer is a READ and not a bare roster: the
+    // caller has to know the directory is partial.
     const keep = regionStateOf(current(), region).enabledModelIds ?? []
     return client.fetchModels(credential, signal, keep)
   }
+
+  /**
+   * The runtime roster an upstream read answers with.
+   *
+   * ISSUE #288. A DEGRADED read — one of the product documents was refused (a
+   * rate limit, a transport error) and the other one answered — is NOT the
+   * upstream's whole offer: it is missing every row the refused document
+   * published. So the SAVED directory fills that gap, and the roster is the
+   * union of the two — the same shape `applySelection` builds through
+   * {@link resolveRoster}, and the same rule issue #32 states: a refresh must
+   * never withdraw a model the user is on.
+   *
+   * The rule itself lives in {@link rosterOfRead}, next to the merge it uses,
+   * so the runtime, the discovery answer and the card's refresh cannot drift
+   * into answering three different things.
+   */
+  const rosterOfReadFor = (
+    region: WorkBuddyRegion,
+    read: WorkBuddyCatalogRead,
+  ): readonly WorkBuddyModelInfo[] =>
+    rosterOfRead(regionStateOf(current(), region).lastCatalog ?? [], read)
   /**
    * Record a refresh the card just asked for (issue #214).
    *
@@ -2401,8 +2436,9 @@ export function apply(ctx: Context, config: Config): void {
    */
   const persistRefreshedModels = async (
     region: WorkBuddyRegion,
-    models: readonly WorkBuddyModelInfo[],
+    read: WorkBuddyCatalogRead,
   ): Promise<void> => {
+    const models = rosterOfReadFor(region, read)
     if (models.length === 0) return
     const state = regionStateOf(current(), region)
     // Derive the runtime roster from the SAME rules the startup refresh uses,
@@ -2417,7 +2453,11 @@ export function apply(ctx: Context, config: Config): void {
       ),
       new Set(savedOffModelIds(state, models)),
     )
-    stacks[region].catalog.set(next)
+    // The degradation rides along with the roster (issue #288): a directory
+    // read from the surviving document is a partial answer, and the card has
+    // to be able to say so. `origin: 'upstream'` because this roster IS the
+    // upstream's answer — a degraded one, but still the upstream's.
+    stacks[region].catalog.set(next, 'upstream', read.degraded)
     invalidateCatalog()
     // The DIRECTORY. `repairRegionCatalog` is the one writer that knows the
     // merge (it preserves the other region and this slot's sibling fields,
@@ -2425,11 +2465,16 @@ export function apply(ctx: Context, config: Config): void {
     // fingerprint already agrees). Reusing it rather than writing here keeps
     // one definition of "what a correct directory looks like".
     //
+    // The RAW answer goes in, not the derived roster: the repair merges the
+    // saved directory over it, so the rows the refused document published are
+    // kept with the capabilities they were saved with — a degraded read must
+    // not shrink the directory either (issue #288).
+    //
     // `strict` because THIS call is the answer to a user's click: the route
     // reports the fresh prices on the strength of this write, so a swallowed
     // failure would produce a 200 for a save that did not happen — the exact
     // class of bug being fixed here.
-    await repairRegionCatalog(region, models, { strict: true })
+    await repairRegionCatalog(region, read.models, { strict: true })
   }
   /**
    * The region's MEDIA models, cached briefly for the card's read-only roster.
@@ -3085,6 +3130,15 @@ export function apply(ctx: Context, config: Config): void {
     // directory's prices while the reply carried the upstream's.
     persistModels: persistRefreshedModels,
     /**
+     * Whether this region's directory is a PARTIAL answer (issue #288).
+     *
+     * Read off the catalog, which is the one place that knows: the upstream
+     * read that produced the current roster is the only writer of the fact, and
+     * a derivation keeps it. The card turns it into a notice, so a short model
+     * list is never mistaken for the upstream's whole offer.
+     */
+    catalogDegradation: region => stacks[region].catalog.degradation(),
+    /**
      * This region's first-sighting readout, the data behind the composer pill's
      * "· N 新模型" segment.
      *
@@ -3377,31 +3431,24 @@ export function apply(ctx: Context, config: Config): void {
         if (region !== 'cn' || !poolPreferencesOf(current(), region).enabled) return {}
         const store = stacks[region].store
         const accounts = await store.accounts()
-        const now = Date.now()
         const entries = await Promise.all(accounts.map(async account => {
           // Enterprise accounts do not support check-in; avoid that request.
           if (account.enterprise === true) return undefined
-          // Serve from the cache while it is fresh. The card uses a configurable
-          // polling interval, but "did this account check in today" only changes when a
-          // check-in runs or the day rolls over — so re-reading it on every
-          // poll meant ~14,400 requests/day for a 10-account pool. A check-in
-          // this plugin performs invalidates its own entry (see `checkin`).
-          //
-          // "Fresh" includes the local day (issue #232): the TTL alone would
-          // serve yesterday's reading across midnight, and the poll would then
-          // report an account as done on a day nobody claimed it.
-          const cached = checkinStateCache[region]?.[account.id]
-          if (cached !== undefined && checkinReadingFresh(cached.atMs, now, CHECKIN_CACHE_MS)) {
-            return [account.id, cached.checkedIn] as const
+          // Once recorded done TODAY (by us or by the user in the official
+          // client), never ask upstream again today — that is the whole point of
+          // the day-done memory. Only an account with NO record is read, once.
+          if (await isDoneToday('checkin', region, account.id)) {
+            return [account.id, true] as const
           }
           const credential = await store.credentialFor(account.id).catch(() => undefined)
           if (credential === undefined) return undefined
           const status = await client.fetchCheckinStatus(credential).catch(() => undefined)
           // Personal accounts can also have no active check-in campaign.
           if (status === undefined || !status.active) return undefined
-          checkinStateCache[region] = {
-            ...checkinStateCache[region],
-            [account.id]: { checkedIn: status.todayCheckedIn, atMs: now },
+          if (status.todayCheckedIn) {
+            // The first observation of "done" is enough: persist it so no later
+            // poll (nor a restart today) re-reads this account.
+            await markDoneToday('checkin', region, [account.id])
           }
           return [account.id, status.todayCheckedIn] as const
         }))
@@ -3415,21 +3462,15 @@ export function apply(ctx: Context, config: Config): void {
        * on one request per account. An unmeasured account is absent, which the
        * card already renders as unknown rather than as "not checked in".
        */
-      cachedCheckedInToday(region) {
-        // Same guard as the full read: with the pool off there is no table to
-        // fill, so nothing is reported.
-        if (!poolPreferencesOf(current(), region).enabled) return {}
-        const now = Date.now()
-        const state = checkinStateCache[region] ?? {}
-        const cached: Record<string, boolean> = {}
-        for (const [accountId, entry] of Object.entries(state)) {
-          // Day-bounded as well as TTL-bounded (issue #232): a reading taken
-          // yesterday answers a different question than today's column asks.
-          if (!checkinReadingFresh(entry.atMs, now, CHECKIN_CACHE_MS)) continue
-          cached[accountId] = entry.checkedIn
-        }
-        return cached
-      },
+      /**
+       * Today's checked-in accounts for the first paint (issue #77).
+       *
+       * Reads the persistent done-today memory and NOTHING else: no upstream
+       * request, so painting never blocks, and — unlike the old in-memory TTL
+       * cache — it survives a restart within the same day. An account with no
+       * record is absent, which the card already renders as unknown.
+       */
+      cachedCheckedInToday: region => doneTodayMap('checkin', region),
       /**
        * Claimable promotional benefits per account (issue #79).
        *
@@ -3554,19 +3595,79 @@ export function apply(ctx: Context, config: Config): void {
         // 「今日：N 个全部已签」 while every row read 未签到.
         return todaySummary(state, Date.now())
       },
+      /**
+       * Today's growth-job progress (issue #286), from the runner's own in-memory
+       * state — same source the tick writes, so the card cannot drift from what
+       * actually ran. `undefined` when the switch is off or nothing has run yet.
+       */
+      growthRedeemToday: region => growthTodayOf('growth-redeem', region),
+      growthActivityToday: region => growthTodayOf('growth-activity', region),
+      /**
+       * Per-account growth completion for the row stamps (issue #286). Backed by
+       * the runner's day state: an account is "done" once today's job addressed
+       * it, regardless of whether it redeemed or was already active. No upstream
+       * read, so it is safe on the card's poll.
+       */
+      // Read the PERSISTENT done-today map so the row stamps survive a restart —
+      // same source as check-in, no upstream request on the card's poll. Also
+      // UNION in the growth runner's own persisted day state: profiles upgraded
+      // from before this store existed already have done accounts there but no
+      // day-map entries, and their stamps must not vanish until the next tick.
+      growthDoneAccountIds: async (region, cap) => {
+        const map: Record<string, boolean> = { ...await doneTodayMap(cap, region) }
+        const state = growthState[growthKey(cap, region)] ?? await readGrowthState(cap, region)
+        if (state !== undefined && state.day === localDayKey(Date.now())) {
+          for (const id of state.doneAccountIds) map[id] = true
+        }
+        return map
+      },
+      /**
+       * Manual "run now" for a growth job (issue #286). Same batch + state as
+       * the timer, but ignores the opt-in switch and the backoff clock: the user
+       * asked for it now. Returns check-in-shaped rows for the shared log UI.
+       */
+      growthRun: async (region, action) => {
+        const cap: GrowthCapability = action === 'growth-redeem' ? 'growth-redeem' : 'growth-activity'
+        const key = growthKey(cap, region)
+        const nowMs = Date.now()
+        const stored = growthState[key] ?? await readGrowthState(cap, region)
+        const state = stored === undefined || stored.day !== localDayKey(nowMs)
+          ? emptyAutoCheckinState(localDayKey(nowMs))
+          : stored
+        const all: GrowthTarget[] = (await poolMemberAccounts(region)).map(account => ({
+          accountId: account.id,
+          accountName: account.accountName,
+        }))
+        const rows = await runGrowthBatch(cap, region, all)
+        // Mark every addressed account settled — no retry, no backoff, no
+        // lastError. The card shows a stable "已兑换/已点亮 X/Y" count and never
+        // re-attempts an account that already ran today.
+        const folded = foldGrowthAttempt(state, rows.map(row => row.accountId), all.length, nowMs)
+        growthState[key] = folded
+        await writeGrowthState(cap, region, folded)
+        // Also record each settled account in the persistent day map so the row
+        // stamps are available immediately and survive a restart.
+        await markDoneToday(cap, region, rows.map(row => row.accountId))
+        return rows.map(row => ({
+          accountId: row.accountId,
+          accountName: row.accountName,
+          status: row.status === 'done' ? 'claimed' : row.status === 'skipped' ? 'already' : 'failed',
+          ...row.credit === undefined ? {} : { credit: row.credit },
+          ...row.message === undefined ? {} : { message: row.message },
+        }))
+      },
       checkin: async region => {
         const rows = await checkinAllAccounts(
           await poolTargets(region),
           poolRunnerDeps(region),
         )
-        // Drop the cached readings for accounts this batch touched, so the
-        // card's check-in column reflects the result immediately rather than
-        // showing the pre-batch state until the TTL expires.
-        for (const row of rows) {
-          if (row.status === 'failed') continue
-          const cached = checkinStateCache[region]
-          if (cached !== undefined) delete cached[row.accountId]
-        }
+        // A successful claim (or an already-checked-in account) is done TODAY:
+        // record it so the card shows the result at once and later polls never
+        // re-read these accounts. Failed rows are left unrecorded and may be read
+        // again next poll.
+        await markDoneToday('checkin', region, rows
+          .filter(row => row.status === 'claimed' || row.status === 'already')
+          .map(row => row.accountId))
         if (rows.some(row => row.status !== 'failed')) {
           await poolMembersOf(region)
           await applyPoolSelection(region)
@@ -4289,6 +4390,8 @@ export function apply(ctx: Context, config: Config): void {
       // `=== true`, not `?? false`: an older profile has no key at all, and an
       // absent answer must read as OFF — this switch authorises a real WRITE.
       autoCheckin: pool?.autoCheckin === true,
+      growthRedeem: pool?.growthRedeem === true,
+      growthActivity: pool?.growthActivity === true,
     }
   }
 
@@ -4449,13 +4552,11 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
       const rows = await checkinAllAccounts(targets, poolRunnerDeps(region))
-      // Drop the cached readings for accounts this batch touched, exactly as the
-      // manual action does, so the card's column reflects the result at once.
-      for (const row of rows) {
-        if (row.status === 'failed') continue
-        const cached = checkinStateCache[region]
-        if (cached !== undefined) delete cached[row.accountId]
-      }
+      // Record successful claims as done today — same as the manual action — so
+      // later polls never re-read them. Failed rows stay unrecorded.
+      await markDoneToday('checkin', region, rows
+        .filter(row => row.status === 'claimed' || row.status === 'already')
+        .map(row => row.accountId))
       // Refresh balance evidence and selection immediately after check-in.
       if (rows.some(row => row.status !== 'failed')) {
         await poolMembersOf(region)
@@ -4525,6 +4626,171 @@ export function apply(ctx: Context, config: Config): void {
 
   syncAutoCheckin()
   ctx.effect(() => () => { stopAutoCheckin() })
+
+  /* ---------------------------------------------------------------------- *
+   * Background growth tasks (issue #286): streak redeem + active-today.
+   *
+   * Same timer shape as auto-check-in, but keyed by (capability, region) so the
+   * three daily states — checked-in, active, redeemed — never overwrite one
+   * another. Both capabilities run in BOTH regions; the two opt-in switches are
+   * independent, and each capability's idempotency is enforced at the SOURCE:
+   *   - redeem sends only tiers the gateway marked `available`;
+   *   - activity reads the heatmap and sends NO ACP session when already active.
+   * A per-day `doneAccountIds` is only a cost optimisation on top (skip accounts
+   * this process already settled today), never the correctness guarantee.
+   * ---------------------------------------------------------------------- */
+  const growthTimers: Partial<Record<string, ReturnType<typeof setTimeout>>> = {}
+  const growthState: Partial<Record<string, AutoCheckinState>> = {}
+  const growthRunning: Partial<Record<string, boolean>> = {}
+  const GROWTH_IDLE_MS = AUTO_CHECKIN_IDLE_MS
+  const growthKey = (cap: GrowthCapability, region: WorkBuddyRegion): string => `${cap}:${region}`
+
+  /** Today's summary for one growth job, for the card's status line. */
+  function growthTodayOf(
+    cap: GrowthCapability,
+    region: WorkBuddyRegion,
+  ): WorkBuddyWebGrowthToday | undefined {
+    if (!growthEnabled(cap, region)) return undefined
+    const state = growthState[growthKey(cap, region)]
+    return growthTodaySummary(state, localDayKey(Date.now()))
+  }
+
+  /** Both growth capabilities apply to both regions — unlike check-in. */
+  const GROWTH_REGIONS: readonly WorkBuddyRegion[] = ['cn', 'global']
+  const GROWTH_CAPABILITIES: readonly GrowthCapability[] = ['growth-redeem', 'growth-activity']
+
+  function growthEnabled(cap: GrowthCapability, region: WorkBuddyRegion): boolean {
+    const prefs = poolPreferencesOf(current(), region)
+    // Redeem/activity are meaningful only for pooled accounts; the pool being
+    // OFF means no membership list was authorised, so nothing may be touched.
+    if (!prefs.enabled) return false
+    return cap === 'growth-redeem' ? prefs.growthRedeem : prefs.growthActivity
+  }
+
+  /** The ACP model for one region: its first advertised model, or a safe fallback. */
+  function growthAcpModel(region: WorkBuddyRegion): string {
+    const roster = displayModels(current(), region).filter(model => !isRouterModelId(model.id))
+    return roster[0]?.id ?? (region === 'cn' ? 'hy3' : 'deepseek-v4.1-flash')
+  }
+
+  /**
+   * Execute one growth batch over the given targets — the ONE implementation
+   * both the background timer and the manual "run now" button call. Never throws
+   * at the batch level; each account's problem is captured on its own row by the
+   * runner. Returns the raw growth rows (done/skipped/failed).
+   */
+  async function runGrowthBatch(
+    cap: GrowthCapability,
+    region: WorkBuddyRegion,
+    targets: readonly GrowthTarget[],
+  ): Promise<ReturnType<typeof redeemGrowthAll>> {
+    const store = stacks[region].store
+    if (cap === 'growth-redeem') {
+      return redeemGrowthAll(targets, {
+        credentialFor: id => store.credentialFor(id),
+        readStreak: credential => client.fetchGrowthStreak(credential as WorkBuddyCredential),
+        redeem: (credential, tier) => client.redeemGrowthTier(credential as WorkBuddyCredential, tier),
+      })
+    }
+    const model = growthAcpModel(region)
+    return activateGrowthAll(targets, async accountId => {
+      const credential = await store.credentialFor(accountId)
+      if (credential === undefined) return { status: 'failed', reason: 'no stored credential' }
+      // One host derivation for both the console API and its Origin/Referer,
+      // following the credential's own region — never a region argument.
+      const host = growthHostOf(credential)
+      return activateGrowth({
+        base: host,
+        accessToken: credential.accessToken,
+        origin: host,
+        model,
+        heatmap: async () => {
+          const cell = await client.fetchGrowthToday(credential)
+          return cell === undefined ? undefined : { isActive: cell.isActive, score: cell.score }
+        },
+      })
+    })
+  }
+
+  /** Run one capability for one region across its pooled members. Never throws. */
+  async function growthTick(cap: GrowthCapability, region: WorkBuddyRegion): Promise<void> {
+    const key = growthKey(cap, region)
+    if (growthRunning[key] === true) return
+    growthRunning[key] = true
+    try {
+      if (!growthEnabled(cap, region)) return
+      const nowMs = Date.now()
+      const today = localDayKey(nowMs)
+      const stored = growthState[key] ?? await readGrowthState(cap, region)
+      const state = stored === undefined || stored.day !== today
+        ? emptyAutoCheckinState(today)
+        : stored
+      growthState[key] = state
+      const all: GrowthTarget[] = (await poolMemberAccounts(region)).map(account => ({
+        accountId: account.id,
+        accountName: account.accountName,
+      }))
+      const targets = growthPendingTargets(all, state)
+      if (targets.length === 0) {
+        // Everyone was already settled today: nothing to retry, just keep the
+        // idle heartbeat alive for the day rollover.
+        scheduleGrowth(cap, region, GROWTH_IDLE_MS)
+        return
+      }
+      const rows = await runGrowthBatch(cap, region, targets)
+      // Every addressed account is settled for the day — including one whose
+      // upstream read failed. No backoff/lastError: the user asked for a stable
+      // "已兑换/已点亮" state, not a retry loop. Denominator is the real member
+      // count, never accumulated.
+      const folded = foldGrowthAttempt(state, rows.map(row => row.accountId), all.length, nowMs)
+      growthState[key] = folded
+      await writeGrowthState(cap, region, folded)
+      await markDoneToday(cap, region, rows.map(row => row.accountId))
+      scheduleGrowth(cap, region, GROWTH_IDLE_MS)
+    } catch (error: unknown) {
+      ctx.logger.warn(`dsh-connect-workbuddy: growth tick failed (${cap}/${region})`, error)
+      scheduleGrowth(cap, region, GROWTH_IDLE_MS)
+    } finally {
+      growthRunning[key] = false
+    }
+  }
+
+  function scheduleGrowth(cap: GrowthCapability, region: WorkBuddyRegion, delayMs: number): void {
+    const key = growthKey(cap, region)
+    const existing = growthTimers[key]
+    if (existing !== undefined) clearTimeout(existing)
+    const timer = setTimeout(() => { void growthTick(cap, region) }, delayMs)
+    timer.unref?.()
+    growthTimers[key] = timer
+  }
+
+  function syncGrowth(): void {
+    for (const cap of GROWTH_CAPABILITIES) {
+      for (const region of GROWTH_REGIONS) {
+        const key = growthKey(cap, region)
+        if (growthEnabled(cap, region)) {
+          if (growthTimers[key] === undefined) scheduleGrowth(cap, region, 0)
+          continue
+        }
+        const timer = growthTimers[key]
+        if (timer !== undefined) {
+          clearTimeout(timer)
+          delete growthTimers[key]
+        }
+      }
+    }
+  }
+
+  function stopGrowth(): void {
+    for (const timer of Object.values(growthTimers)) clearTimeout(timer)
+    for (const key of Object.keys(growthTimers)) delete growthTimers[key]
+  }
+
+  // The settings object is live; re-sync on every write just like auto-check-in.
+  // Called once here and again from the settings-change path below.
+  function refreshGrowthSchedules(): void { syncGrowth() }
+  refreshGrowthSchedules()
+  ctx.effect(() => () => { stopGrowth() })
 
   // Settings registration (0.1.7+ only).
   // `SettingsForms` dropped `installSection` entirely and exposes
@@ -4598,6 +4864,9 @@ export function apply(ctx: Context, config: Config): void {
       // The auto check-in switch lives in the same volatile region slot, so this
       // is also where turning it on or off takes effect — without a restart.
       syncAutoCheckin()
+      // The two growth switches (issue #286) are volatile siblings; re-arm or
+      // disarm their timers on the same update so a toggle takes effect at once.
+      refreshGrowthSchedules()
       // 总开关同样是 volatile：不重挂，所以预热链要在这里跟随，否则关着启动的
       // 进程打开开关后永远没有定时器（只有一次请求才偶尔取到 token）。
       syncDeviceSdk()
@@ -4784,9 +5053,14 @@ export function apply(ctx: Context, config: Config): void {
           // this is defence in depth against a stale model-picker refresh.
           if (!regionEnabled(current(), region)) return []
           const discovered = await discoverModels(region, signal)
+          // A DEGRADED read is answered with the saved directory's rows beside
+          // the surviving ones (issue #288) — otherwise a refused product
+          // document could empty the model picker down to the handful of rows
+          // the other document happens to carry, with nothing saying why.
+          const roster = rosterOfReadFor(region, discovered)
           // Load levels are stamped on the RUNTIME roster only — see
           // `withBusyLevels` for why the settings draft stays free of them.
-          const live = await withBusyLevels(region, discovered, signal)
+          const live = await withBusyLevels(region, roster, signal)
           const state = regionStateOf(current(), region)
           const next = withImageSelection(
             deriveCatalog(
@@ -4842,16 +5116,22 @@ export function apply(ctx: Context, config: Config): void {
         void (async () => {
           try {
             const credential = await stacks[region].store.resolve()
-            const models = await withBusyLevels(
-              region,
-              await client.fetchModels(
-                credential,
-                undefined,
-                regionStateOf(current(), region).enabledModelIds ?? [],
-              ),
+            const read = await client.fetchModels(
+              credential,
+              undefined,
+              regionStateOf(current(), region).enabledModelIds ?? [],
             )
+            // A DEGRADED read is answered with the saved directory's rows
+            // beside the surviving ones (issue #288): the refused document's
+            // rows are still the upstream's offer, they are just not in this
+            // answer. Without them a rate limit could leave the picker with
+            // one row and nothing to explain it.
+            const models = await withBusyLevels(region, rosterOfReadFor(region, read))
             if (stopped) return
             const state = regionStateOf(current(), region)
+            // The degradation rides with the roster, so the card can say the
+            // directory is partial (issue #288) instead of the user reading
+            // the shrunken list as their own selection.
             stacks[region].catalog.set(withEffectiveOff(
               withImageSelection(
                 deriveCatalog(models, new Set(state.enabledModelIds ?? []), state.contextBudgets ?? {}),
@@ -4862,7 +5142,7 @@ export function apply(ctx: Context, config: Config): void {
                 effectiveImageIds(state, models),
               ),
               new Set(savedOffModelIds(state, models)),
-            ))
+            ), 'upstream', read.degraded)
             adapters[region].invalidate()
             // Record when THIS machine first saw each id of the roster that just
             // landed — the whole "· N 新模型" story. This is the ONLY writer of
@@ -4896,7 +5176,10 @@ export function apply(ctx: Context, config: Config): void {
             // before writing, and awaiting here is what keeps the two writers
             // from landing out of order.
             await regionsFieldHealed
-            await repairRegionCatalog(region, models)
+            // The RAW answer, not the derived roster: the repair merges the
+            // saved directory over it, so a degraded read heals the directory
+            // instead of shrinking it (issue #288).
+            await repairRegionCatalog(region, read.models)
           } catch (error: unknown) {
             ctx.logger.warn(
               `dsh-connect-workbuddy: dynamic ${region} model catalog unavailable; serving the static fallback list`,

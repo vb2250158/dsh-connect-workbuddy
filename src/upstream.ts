@@ -315,6 +315,64 @@ export interface WorkBuddyCheckinClaim {
   isStreakDay: boolean
 }
 
+/* ------------------------------------------------------------------------- *
+ * Growth center (issue #286)
+ * ------------------------------------------------------------------------- *
+ * Two read-only facts and one write, shared by BOTH regions. The growth API
+ * lives on the SAME host as billing, so every method here reuses
+ * `billingBase(credential, cnBaseOf())` and `billingHeaders(...)` — the region
+ * follows `credential.domain`, never a `region` argument. That is the whole
+ * point: one implementation serves CN and international accounts alike.
+ *
+ * ENDPOINT SHAPES (measured by the issue reporter on both regions, 2026-11-20):
+ *   GET /v2/activity/growth/heatmap  → data.today.{is_active,score,date,status_text}
+ *   GET /activity/growth/streak      → data.{streak,makeup_cards,redemption_status}
+ *   POST /activity/growth/redeem     body {"tier":"7d"|"14d"|"28d"}
+ * The prefix rule is CONFUSED in the reporter's own attachment: one file says
+ * "growth paths must NOT carry /v2", while the summary table says both spellings
+ * answer 200 and "METHOD matters more than prefix". The read methods below try
+ * the `/v2` form first and fall back to the bare form on a 404, so either
+ * upstream reality works. Only `redeem` (a WRITE) is pinned to one path.
+ */
+
+/** Today's heatmap cell: whether the account was active and its score. */
+export interface WorkBuddyGrowthToday {
+  date: string
+  isActive: boolean
+  score: number
+  statusText?: string
+}
+
+/** One redeemable streak tier as the upstream publishes it. */
+export interface WorkBuddyGrowthTier {
+  tier: string
+  days: number
+  credit: number
+  energy?: number
+  cards?: number
+  chances?: number
+}
+
+/** Streak + redemption snapshot, reduced to what the card and runner need. */
+export interface WorkBuddyGrowthStreak {
+  days: number
+  monthTotalDays: number
+  monthConsumedDays: number
+  nextTier?: string
+  nextTierRemaining: number
+  /** Tier ids (`7d`/`14d`/`28d`) the gateway says are claimable NOW. */
+  availableTiers: readonly string[]
+  makeupCardBalance: number
+}
+
+/** Result of redeeming one tier. */
+export interface WorkBuddyGrowthRedeemResult {
+  tier: string
+  credit: number
+  energy?: number
+  alreadyClaimed?: boolean
+}
+
 /**
  * One promotional benefit the account may or may not still be entitled to.
  *
@@ -1778,6 +1836,15 @@ function billingBase(credential: WorkBuddyCredential, cnBase?: string): string {
   // reset). An override that fixed chat but left check-in and credits on a
   // blocked host would look like a half-broken plugin rather than a workaround.
   return cnBase === undefined || cnBase === '' ? CN_BILLING_BASE : cnBase
+}
+
+/**
+ * Console/growth host for a credential — the SAME host `billingBase` resolves
+ * to (issue #286). Exported so the ACP layer can address the console API
+ * without re-deriving the region from the domain itself.
+ */
+export function growthHostOf(credential: WorkBuddyCredential, cnBase?: string): string {
+  return billingBase(credential, cnBase)
 }
 
 function originReferer(credential: WorkBuddyCredential): string {
@@ -4684,6 +4751,44 @@ function parseEnterpriseInstant(value: string): number | undefined {
 }
 
 /**
+ * An upstream failure that carries the upstream's OWN words.
+ *
+ * The summary an error message carries is truncated to 160 characters, which
+ * is right for a log line and wrong for the one caller that needs the whole
+ * sentence: the upstream states its recovery time in prose, and that sentence
+ * must reach the card intact (see {@link WorkBuddyCatalogDegradation}).
+ *
+ * So the full body travels beside the summary rather than inside it.
+ */
+export class WorkBuddyUpstreamError extends Error {
+  /** HTTP status the upstream answered with. */
+  readonly status: number
+  /** The upstream's own words, untruncated. */
+  readonly body: string
+
+  constructor(status: number, body: string, summary: string) {
+    super(summary)
+    this.name = 'WorkBuddyUpstreamError'
+    this.status = status
+    this.body = body
+  }
+}
+
+/**
+ * The upstream's own words for a failed read, or the error's message when the
+ * failure was not an upstream answer (a transport error, a roster that
+ * resolved to nothing).
+ *
+ * The fallback reader needs the raw body for the recovery sentence; the log
+ * line needs the summary. Both come from here, so the two can never disagree
+ * about which failure this was.
+ */
+export function upstreamBodyOf(error: unknown): string {
+  if (error instanceof WorkBuddyUpstreamError) return error.body
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
  * Fail an envelope whose business code is non-zero, classified like HTTP errors.
  *
  * A JSON body on a 401/403 is still a credential refusal: the edge answered in
@@ -4704,7 +4809,11 @@ function parseEnterpriseInstant(value: string): number | undefined {
 function envelopeError(status: number, envelope: Envelope): Error {
   if (status === 401 || status === 403) return new WorkBuddyCredentialRejectedError(status)
   const kind = classifyUpstreamError(status, `{"code":${envelope.code},"msg":${JSON.stringify(envelope.msg)}}`)
-  return new Error(`workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`)
+  return new WorkBuddyUpstreamError(
+    status,
+    envelope.msg,
+    `workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`,
+  )
 }
 
 /**
@@ -4824,6 +4933,69 @@ export function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | und
     ...descriptionEn === undefined ? {} : { descriptionEn },
     ...supportsToolCall === undefined ? {} : { supportsToolCall },
   }
+}
+
+/**
+ * Which document a model directory was read from.
+ *
+ * THE THREE SOURCES, and why a reader needs to name them.
+ *
+ * - `app`: the `/v3/config` product document read as the APP's identity. Both
+ *   regions read it; the CN region reads nothing else.
+ * - `cli`: the SAME document read as the CLI channel's identity. The
+ *   international region reads both, because neither document is a superset of
+ *   the other (see {@link mergeModelRosters}).
+ * - `legacy`: the CN region's legacy catalog path, the fallback for a gateway
+ *   that stops serving the modern document.
+ *
+ * A reader that fell back from one to another is answering with a PARTIAL
+ * directory, and the user has to be told which part is missing — see
+ * {@link WorkBuddyCatalogDegradation}.
+ */
+export type WorkBuddyCatalogSource = 'app' | 'cli' | 'legacy'
+
+/**
+ * A model directory that came from a FALLBACK document.
+ *
+ * ISSUE #288. The international region reads `/v3/config` twice, as the CLI
+ * channel and as the app channel, and the two documents publish DIFFERENT
+ * rosters: the CLI one carries `fast-model` / `balanced-model` /
+ * `primary-model` / `deepseek-v4.1-flash` / `hy4-preview` / `gpt-5.5` /
+ * `gpt-5.4` / `glm-5.2`, the app one carries `max-model` / `hy4free` /
+ * `hy4std` (measured on a real account 2026-11-06).
+ *
+ * So when one read fails — a rate limit (`soft_rate` / `quota_exceeded`), a
+ * transport error — the fallback to the OTHER document is a downgrade, not a
+ * convenience: every row the refused document published is missing from the
+ * answer. The fallback used to be reported only in the log, and the roster it
+ * produced was then filtered by the user's selection — so a rate limit could
+ * collapse the model picker down to the handful of rows the surviving document
+ * happened to carry, with nothing on screen saying why.
+ *
+ * `body` is the upstream's OWN words (untruncated), because the upstream states
+ * its recovery time in prose — 「将在 2026-09-30 02:30:30 UTC+8 重置」 — and that
+ * sentence is the one thing worth showing the user.
+ */
+export interface WorkBuddyCatalogDegradation {
+  /** The document that was NOT read. */
+  readonly missing: WorkBuddyCatalogSource
+  /** The document the answer came from instead. */
+  readonly used: WorkBuddyCatalogSource
+  /** The upstream's own words, untruncated. */
+  readonly body: string
+}
+
+/**
+ * One model-directory read: the roster, and whether it is the whole truth.
+ *
+ * `degraded` absent means the read was COMPLETE — every document the region
+ * reads answered, so the roster is the upstream's current offer. Present means
+ * one document was refused and the answer came from the other, so the roster is
+ * missing rows the upstream does publish.
+ */
+export interface WorkBuddyCatalogRead {
+  readonly models: readonly WorkBuddyUpstreamModel[]
+  readonly degraded?: WorkBuddyCatalogDegradation
 }
 
 /**
@@ -5370,12 +5542,20 @@ export class WorkBuddyUpstreamClient {
    * document still publishes stays in the roster, so reading the directory
    * never withdraws a model the user is running (issue #32's failure mode,
    * one step upstream of it).
+   *
+   * THE ANSWER IS A {@link WorkBuddyCatalogRead}, not a bare roster, because a
+   * FALLBACK read is a partial answer and the caller has to be able to tell
+   * (issue #288). The international region reads two documents that publish
+   * different rosters, so "the CLI read was refused and the app document
+   * answered" is a downgrade the user must be told about — and a roster that
+   * silently lost the CLI-only rows would otherwise look like the user's own
+   * selection had shrunk.
    */
   async fetchModels(
     credential: WorkBuddyCredential,
     signal?: AbortSignal,
     keepModelIds: readonly string[] = [],
-  ): Promise<readonly WorkBuddyUpstreamModel[]> {
+  ): Promise<WorkBuddyCatalogRead> {
     const timeout = signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS)
     const global = regionOf(credential.domain) === 'global'
     if (global) {
@@ -5423,6 +5603,21 @@ export class WorkBuddyUpstreamClient {
        * a complete answer and is returned as-is — reported through
        * `onFallback` rather than swallowed, because the desktop-only rows then
        * disappear from the picker and that is worth a log line.
+       *
+       * ⚠️ A FALLBACK IS A DOWNGRADE, AND IT SAYS SO (issue #288). The two
+       * documents publish different rosters, so the answer built from the
+       * surviving one is missing every row the refused one published — the
+       * CLI-only rows (`fast-model`, `balanced-model`, `primary-model`,
+       * `deepseek-v4.1-flash`, `hy4-preview`, …) are exactly what the app
+       * document does not carry. That roster was then filtered by the user's
+       * own selection, so a rate limit could empty the model picker down to
+       * one or two rows, with the profile still holding the full directory and
+       * nothing on screen to explain the difference.
+       *
+       * So the answer now carries WHICH document was refused and what the
+       * upstream said, and the caller keeps the saved directory's rows beside
+       * the surviving ones. The log line stays; it is just no longer the ONLY
+       * place the fact exists.
        */
       let cliRoster: readonly WorkBuddyUpstreamModel[]
       try {
@@ -5432,7 +5627,8 @@ export class WorkBuddyUpstreamClient {
           `global CLI catalog ${GLOBAL_CONFIG_PATH} failed; using the app document only: `
           + (error instanceof Error ? error.message : String(error)),
         )
-        return await readChannel(APP_CHANNEL_UA)
+        const appRoster = await readChannel(APP_CHANNEL_UA)
+        return { models: appRoster, degraded: { missing: 'cli', used: 'app', body: upstreamBodyOf(error) } }
       }
       let appRoster: readonly WorkBuddyUpstreamModel[]
       try {
@@ -5442,9 +5638,9 @@ export class WorkBuddyUpstreamClient {
           `global app catalog ${GLOBAL_CONFIG_PATH} failed; using the CLI document only: `
           + (error instanceof Error ? error.message : String(error)),
         )
-        return cliRoster
+        return { models: cliRoster, degraded: { missing: 'app', used: 'cli', body: upstreamBodyOf(error) } }
       }
-      return mergeModelRosters(cliRoster, appRoster)
+      return { models: mergeModelRosters(cliRoster, appRoster) }
     }
     const readCatalog = async (path: string): Promise<readonly WorkBuddyUpstreamModel[]> => {
       const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${path}`, {
@@ -5465,17 +5661,23 @@ export class WorkBuddyUpstreamClient {
       return withPromos(selectCliModels(data['models'], data['agents'], keepModelIds), data)
     }
     try {
-      return await readCatalog(GLOBAL_CONFIG_PATH)
+      return { models: await readCatalog(GLOBAL_CONFIG_PATH) }
     } catch (error: unknown) {
       // Three failures land here, and all three want the fallback: a transport
       // error, a non-zero envelope, and an EMPTY roster — `selectCliModels`
       // throws on the last one, so a `/v3` that stops listing models degrades
       // rather than emptying the region.
+      //
+      // The legacy document is a DIFFERENT roster, so this fallback is a
+      // downgrade too (issue #288): the answer is missing whatever the modern
+      // document published and the legacy one does not. It says so in the
+      // answer, not only in the log line.
       this.onFallback?.(
         `CN model catalog ${GLOBAL_CONFIG_PATH} failed; falling back to ${MODELS_CATALOG_PATH}: `
         + (error instanceof Error ? error.message : String(error)),
       )
-      return await readCatalog(MODELS_CATALOG_PATH)
+      const legacy = await readCatalog(MODELS_CATALOG_PATH)
+      return { models: legacy, degraded: { missing: 'app', used: 'legacy', body: upstreamBodyOf(error) } }
     }
   }
 
@@ -6019,6 +6221,135 @@ export class WorkBuddyUpstreamClient {
       credit: numberField('credit'),
       streakDays: numberField('streak_days'),
       isStreakDay: data['is_streak_day'] === true,
+    }
+  }
+
+  /**
+   * GET one growth-center path, trying `/v2` then the bare form.
+   *
+   * The attachment disagrees with itself on whether growth paths carry `/v2`
+   * (see the endpoint note above). Rather than pin one spelling and be wrong on
+   * half the deployments, a 404 on the first form retries the second. Only a
+   * clean `code: 0` envelope is accepted; a business error is returned as-is.
+   * Returns `undefined` when NEITHER shape answered successfully.
+   */
+  private async readGrowthData(
+    credential: WorkBuddyCredential,
+    barePath: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    const base = billingBase(credential, this.cnBaseOf())
+    for (const path of [`/v2${barePath}`, barePath]) {
+      let response: Response
+      try {
+        response = await fetch(`${base}${path}`, {
+          method: 'GET',
+          headers: billingHeaders(credential, await this.wireIdentity(credential)),
+          signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+        })
+      } catch {
+        // A transport fault on the first spelling is retried on the second;
+        // both failing simply yields no answer (callers report it honestly).
+        continue
+      }
+      if (!response.ok) {
+        if (response.status === 404) continue
+        return undefined
+      }
+      let envelope: Envelope
+      try {
+        envelope = await readEnvelope(response)
+      } catch {
+        return undefined
+      }
+      if (envelope.code !== 0) return undefined
+      return typeof envelope.data === 'object' && envelope.data !== null
+        ? envelope.data as Record<string, unknown>
+        : {}
+    }
+    return undefined
+  }
+
+  /** Today's heatmap cell, or undefined when the gateway gave no usable answer. */
+  async fetchGrowthToday(credential: WorkBuddyCredential): Promise<WorkBuddyGrowthToday | undefined> {
+    const data = await this.readGrowthData(credential, '/activity/growth/heatmap')
+    if (data === undefined) return undefined
+    const today = typeof data['today'] === 'object' && data['today'] !== null
+      ? data['today'] as Record<string, unknown>
+      : undefined
+    if (today === undefined) return undefined
+    const numberField = (key: string): number => typeof today[key] === 'number' ? today[key] as number : 0
+    return {
+      date: typeof today['date'] === 'string' ? today['date'] : '',
+      isActive: today['is_active'] === true,
+      score: numberField('score'),
+      ...typeof today['status_text'] === 'string' && today['status_text'] !== ''
+        ? { statusText: today['status_text'] as string }
+        : {},
+    }
+  }
+
+  /** Streak + redemption snapshot, or undefined when unreadable. */
+  async fetchGrowthStreak(credential: WorkBuddyCredential): Promise<WorkBuddyGrowthStreak | undefined> {
+    const data = await this.readGrowthData(credential, '/activity/growth/streak')
+    if (data === undefined) return undefined
+    const streak = typeof data['streak'] === 'object' && data['streak'] !== null
+      ? data['streak'] as Record<string, unknown>
+      : {}
+    const redemption = typeof data['redemption_status'] === 'object' && data['redemption_status'] !== null
+      ? data['redemption_status'] as Record<string, unknown>
+      : {}
+    const cards = typeof data['makeup_cards'] === 'object' && data['makeup_cards'] !== null
+      ? data['makeup_cards'] as Record<string, unknown>
+      : {}
+    const num = (obj: Record<string, unknown>, key: string): number =>
+      typeof obj[key] === 'number' ? obj[key] as number : 0
+    // `redemption_status` carries `tier_7d_status: "available" | "locked"` and
+    // a `tiers[]` array. Derive claimable ids from the status fields so a tier
+    // the gateway marks locked is NEVER redeemed (a write we must not send).
+    const availableTiers: string[] = []
+    for (const tier of ['7d', '14d', '28d']) {
+      if (redemption[`tier_${tier}_status`] === 'available') availableTiers.push(tier)
+    }
+    return {
+      days: num(streak, 'days'),
+      monthTotalDays: num(streak, 'month_total_days'),
+      monthConsumedDays: num(streak, 'month_consumed_days'),
+      ...typeof streak['next_tier'] === 'string' && streak['next_tier'] !== ''
+        ? { nextTier: streak['next_tier'] as string }
+        : {},
+      nextTierRemaining: num(streak, 'next_tier_remaining'),
+      availableTiers,
+      makeupCardBalance: num(cards, 'balance'),
+    }
+  }
+
+  /**
+   * Redeem one streak tier. The CALLER must only pass a tier the gateway marked
+   * `available`; this method does not re-check, so the decision stays in the
+   * batch runner where it can be reported and tested. The browser/host route
+   * guards this mutation with POST + loopback like every other write.
+   */
+  async redeemGrowthTier(
+    credential: WorkBuddyCredential,
+    tier: string,
+  ): Promise<WorkBuddyGrowthRedeemResult> {
+    const response = await fetch(`${billingBase(credential, this.cnBaseOf())}/activity/growth/redeem`, {
+      method: 'POST',
+      headers: billingHeaders(credential, await this.wireIdentity(credential)),
+      body: JSON.stringify({ tier }),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const num = (key: string): number => typeof data[key] === 'number' ? data[key] as number : 0
+    return {
+      tier,
+      credit: num('credit'),
+      ...typeof data['energy'] === 'number' ? { energy: data['energy'] as number } : {},
+      ...data['already_claimed'] === true ? { alreadyClaimed: true } : {},
     }
   }
 

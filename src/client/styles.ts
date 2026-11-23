@@ -700,6 +700,13 @@ export const WORKBUDDY_CARD_CSS = `
    the header reads as one group of equal actions. */
 .dsm-workbuddy-models-sweep{white-space:nowrap}
 .dsm-workbuddy-models-sweep-summary{margin:6px 0 0;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary,#c6c9d0)}
+/* The degraded-directory notice (issue #288). AMBER, not red: nothing failed —
+   one product document was refused and the other one answered, so the list is
+   short rather than wrong. Red would read as "the plugin is broken", and the
+   user would go looking for a fault that is not there. */
+.dsm-workbuddy-models-degraded{margin:8px 0 0;padding:8px 10px;border:1px solid var(--dsw-alias-state-warn-primary,#f59e0b);border-radius:8px}
+.dsm-workbuddy-models-degraded-line{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary,#f59e0b);word-break:break-word}
+.dsm-workbuddy-models-degraded-line+.dsm-workbuddy-models-degraded-line{margin-top:4px}
 .dsm-workbuddy-model-probe{flex:none;padding:3px 10px;font-size:11px;line-height:16px}
 .dsm-workbuddy-model-probe-result{margin:0;font-size:12px;line-height:18px;word-break:break-word}
 .dsm-workbuddy-model-probe-result-ok{color:var(--dsw-alias-state-success-primary,#22a06b)}
@@ -1029,6 +1036,12 @@ export const WORKBUDDY_CARD_CSS = `
  * is a seasonal campaign, so the row keeps its honest wrap instead. */
 .dsm-workbuddy-pool-credits{grid-area:credits;display:flex;flex-direction:row;flex-wrap:wrap;align-items:baseline;justify-content:flex-end;gap:0 6px;min-width:0;justify-self:end;text-align:right;font-variant-numeric:tabular-nums}
 .dsm-workbuddy-pool-credits b{color:var(--dsw-alias-label-primary,#e6e6e6);font-weight:600}
+/* All three day-state stamps (已签到/已兑换/已点亮) sit together beside the
+   credits. Smaller than the row text (11px) and quiet-success green — they are
+   confirmations, not the facts the row is about. The group wraps on narrow cards
+   rather than pushing the credits figure off the right edge. */
+.dsm-workbuddy-pool-daystamps{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:4px;font-size:11px;line-height:16px;color:var(--dsw-alias-state-success-primary,#22a06b)}
+.dsm-workbuddy-pool-daystamp{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;background:rgba(34,160,107,.14);cursor:help}
 .dsm-workbuddy-pool-soon{font-size:11px;line-height:16px;color:var(--dsw-alias-state-warn-primary,#f59e0b)}
 /* Claimable benefits (issue #79). A quiet line by default — it is an opportunity, not a fault — and loud only when the window is about to close. */
 .dsm-workbuddy-pool-benefits{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#999);min-width:0}

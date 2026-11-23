@@ -63,6 +63,7 @@ import {
 } from '../status-paths.ts'
 import type {
   WorkBuddyCreditPosition,
+  WorkBuddyWebCatalogDegradation,
   WorkBuddyWebMediaModel,
   WorkBuddyWebModel,
   WorkBuddyWebProbeResult,
@@ -99,7 +100,7 @@ import { busyIcon } from './busy-icon.tsx'
 import { promoBadgeColor, promoBadgeLabel, promoBadgeTooltip, uiLanguage } from './promo-badge.ts'
 import { inlineProbeReason } from './probe-reason.ts'
 import { remainingText } from './remaining.ts'
-import { availabilityLine } from './account-state.ts'
+import { availabilityLine, formatShortClock } from './account-state.ts'
 import { IconStylePreference, PluginIcon } from './plugin-icon.tsx'
 import { updateStickyTabs } from './series-layout.ts'
 import { WORKBUDDY_CARD_CSS } from './styles.ts'
@@ -332,6 +333,27 @@ interface WorkBuddyDraft {
    * does not declare and make the runtime fall back silently.
    */
   defaultThinkingEfforts: Record<string, string>
+  /**
+   * The refresh this draft came from was a DEGRADED read (issue #288): one
+   * product document was refused and the other one answered, so the rows the
+   * refused document published are missing from the answer.
+   *
+   * `null` means "the last refresh was COMPLETE" and `undefined` means "no
+   * refresh has produced this draft" — two different facts, so they are two
+   * different values. A draft that was never refreshed must not claim the
+   * directory was complete.
+   */
+  degraded?: WorkBuddyWebCatalogDegradation | null
+  /**
+   * The model ids this draft carried over from the previous list because the
+   * degraded refresh did not return them (issue #288).
+   *
+   * They are the upstream's offer — the refused document still publishes them
+   * — so dropping them would shrink the user's directory, and a later save
+   * would write the shrunken list back over the saved one. Naming them is
+   * what lets the card say WHICH rows are from the saved snapshot.
+   */
+  carriedIds: readonly string[]
 }
 
 /** Inject or refresh the shared card CSS for the current client bundle. */
@@ -2074,10 +2096,21 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
         headers: { accept: 'application/json' },
         credentials: 'same-origin',
       })
-      const body = await response.json() as { models?: WorkBuddyWebModel[] }
+      const body = await response.json() as { models?: WorkBuddyWebModel[], degraded?: WorkBuddyWebCatalogDegradation }
       if (!response.ok || !Array.isArray(body.models)) throw new Error(`HTTP ${response.status}`)
       const fresh = body.models
       const freshIds = new Set(fresh.map(model => model.id))
+      // A DEGRADED refresh (issue #288): one product document was refused and
+      // the other one answered, so the answer is missing every row the refused
+      // document published. Those rows are still the upstream's offer, so they
+      // are CARRIED OVER from the current list and the user's picks are NOT
+      // narrowed — a rate limit must not quietly shrink the selection, and a
+      // later save must not write the shrunken list back over the saved
+      // directory.
+      const degraded = body.degraded
+      const carried = degraded === undefined
+        ? []
+        : visibleModels.filter(model => !freshIds.has(model.id))
       // Re-map the user's CURRENT enabled choices and context budgets onto the
       // fresh catalog by model id, so renames and additions never silently lose
       // them. The IMAGE checkboxes are deliberately OVERWRITTEN with the
@@ -2086,7 +2119,9 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
       // flag — that one is true for nearly the whole roster, including
       // text-only models, so it is not a capability answer. The user can still
       // adjust the boxes before saving; only another refresh re-syncs.
-      const stillEnabled = [...activeEnabledIds].filter(id => freshIds.has(id))
+      const stillEnabled = degraded === undefined
+        ? [...activeEnabledIds].filter(id => freshIds.has(id))
+        : [...activeEnabledIds]
       const upstreamImages = fresh
         .filter(model => imageDefaultFor(model))
         .map(model => model.id)
@@ -2106,7 +2141,9 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
       setDrafts(prev => ({
         ...prev,
         [activeRegion]: {
-          models: fresh,
+          // The carried rows keep their place in the list, after the fresh ones:
+          // they are the upstream's offer, just not in this answer.
+          models: [...fresh, ...carried],
           enabledIds: new Set(stillEnabled),
           imageIds: new Set(upstreamImages),
           // The `off` answers are CARRIED FORWARD, not re-synced from upstream:
@@ -2125,6 +2162,10 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
           // model the new roster dropped keeps no entry, so a re-added model
           // starts on the upstream default rather than on a stale pick.
           defaultThinkingEfforts: stillEfforts,
+          // `null` for a complete refresh: the two states are different facts,
+          // so they are two different values (see the draft type).
+          degraded: degraded ?? null,
+          carriedIds: carried.map(model => model.id),
         },
       }))
     } catch (error: unknown) {
@@ -2149,6 +2190,38 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
   // re-mapped onto the current catalog by model id.
   const draft = drafts[activeRegion]
   const visibleModels = draft?.models ?? (status.status === 'signed-in' ? status.models : [])
+  /**
+   * Whether the model directory on screen is a PARTIAL answer (issue #288).
+   *
+   * The DRAFT wins when there is one: its list came from the last refresh, so
+   * the refresh's own answer is the one that describes it — including the
+   * "this refresh was complete" case, which the Host's older status answer
+   * cannot be trusted for (it may not have polled since).
+   *
+   * Without a draft the Host's answer is the source: it is the same fact the
+   * runtime roster was built from, so the card and the picker agree.
+   *
+   * `undefined` means "nothing to report" — NOT "the directory is complete",
+   * which the plugin never claims.
+   */
+  const catalogDegraded = draft === undefined
+    ? (status.status === 'signed-in' ? status.catalogDegraded : undefined)
+    : draft.degraded ?? undefined
+  /**
+   * The model ids the current list carries from the saved snapshot because the
+   * last refresh was degraded (issue #288).
+   */
+  const carriedModelIds = draft?.carriedIds ?? []
+  /**
+   * The same rows, by the NAME the list shows them under.
+   *
+   * The notice must name what the reader sees: a notice that says
+   * `fast-model` beside a row that says `Fast` is two names for one thing, and
+   * two names for one thing is how a reader learns to trust neither. The id is
+   * the fallback for a row that is no longer in the list.
+   */
+  const carriedModelNames = carriedModelIds.map(id =>
+    visibleModels.find(model => model.id === id)?.name ?? id)
   /**
    * The LIVE load levels, keyed by model id.
    *
@@ -2205,6 +2278,12 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
         offIds: new Set(activeOffIds),
         contextBudgets: { ...activeContextBudgets },
         defaultThinkingEfforts: { ...activeDefaultEfforts },
+        // The list came from the Host's answer, so the Host's degradation is
+        // the one that describes it (issue #288). `null` when there is nothing
+        // to report — which is NOT the same as "the directory is complete", so
+        // the value is kept as it is rather than folded into a boolean.
+        degraded: status.status === 'signed-in' ? status.catalogDegraded ?? null : null,
+        carriedIds: [],
       }),
     }))
   }
@@ -2621,12 +2700,59 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
     selectionLost,
     message: status.status === 'signed-out' ? status.message : undefined,
     searched,
+    // Issue #285: a token refused DURING REFRESH is not "no sign-in found".
+    // The generic hint sends the user to re-sign-in even when another healthy
+    // local account would fix it. Suppress it here; the dedicated
+    // credential-refused block below carries the accurate advice.
+    credentialRejected: status.status === 'signed-out' && status.credentialRejected === true,
   })
   /**
    * Whether this region runs a saved choice, per the Host. `undefined` only on
    * the error branch, which renders no picker and therefore no state line.
    */
   const selectionExplicit = status.status === 'error' ? undefined : status.selectionExplicit
+
+  /**
+   * The credential-refused advice, shared by the signed-in and signed-out
+   * branches (issue #285). A token can be refused either on a credits read of
+   * an otherwise usable credential, or during `resolve()`'s refresh — the two
+   * land on different `status` values but need the SAME remedy. Keeping one
+   * JSX node is what stops the signed-out copy from drifting back to the
+   * misleading "sign in once" while the signed-in copy says "switch account".
+   */
+  const credentialRejected = status.status !== 'error' && status.credentialRejected === true
+  const rejectedAccountName = status.status === 'signed-in'
+    ? status.accountName
+    : status.status === 'signed-out'
+      ? nameOf(status.accounts.find(account => account.selected)?.accountName ?? '')
+      : ''
+  const recovery = status.status === 'error' ? undefined : status.recovery
+  const credentialRefusedBlock = !credentialRejected ? null : (
+    <section className="dsm-workbuddy-usage-error" role="alert">
+      <strong>{t('row.credentialRejectedTitle')}</strong>
+      <p>{t('row.credentialRejectedIntro', { accountName: nameOf(rejectedAccountName) })}</p>
+      {recovery?.usableAccount !== undefined
+        ? <p>{t('row.credentialRejectedSwitch', { accountName: nameOf(recovery.usableAccount.accountName) })}</p>
+        : recovery?.reloginRequired === true
+          ? <p>{t('row.credentialRejectedRelogin')}</p>
+          : <p>{t('row.credentialRejectedChoose')}</p>}
+      {recovery?.usableAccount === undefined
+        ? null
+        : <button
+            type="button"
+            className="dsm-btn dsm-btn-outline"
+            disabled={switchingAccount || !canWrite}
+            onClick={() => {
+              const target = recovery.usableAccount
+              if (target !== undefined) void switchAccount(target.accountId)
+            }}
+          >
+            {switchingAccount
+              ? t('row.accountsScanning')
+              : t('row.credentialRejectedSwitchAction', { accountName: nameOf(recovery.usableAccount.accountName) })}
+          </button>}
+    </section>
+  )
 
   /**
    * Account-adding and account-migration controls, defined ONCE and rendered
@@ -3785,32 +3911,7 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
                 : null}
               {status.status === 'signed-in'
                 ? <>
-                    {status.credentialRejected === true
-                      ? <section className="dsm-workbuddy-usage-error" role="alert">
-                          <strong>{t('row.credentialRejectedTitle')}</strong>
-                          <p>{t('row.credentialRejectedIntro', { accountName: nameOf(status.accountName) })}</p>
-                          {status.recovery?.usableAccount !== undefined
-                            ? <p>{t('row.credentialRejectedSwitch', { accountName: nameOf(status.recovery.usableAccount.accountName) })}</p>
-                            : status.recovery?.reloginRequired === true
-                              ? <p>{t('row.credentialRejectedRelogin')}</p>
-                              : <p>{t('row.credentialRejectedChoose')}</p>}
-                          {status.recovery?.usableAccount === undefined
-                            ? null
-                            : <button
-                                type="button"
-                                className="dsm-btn dsm-btn-outline"
-                                disabled={switchingAccount || !canWrite}
-                                onClick={() => {
-                                  const target = status.recovery?.usableAccount
-                                  if (target !== undefined) void switchAccount(target.accountId)
-                                }}
-                              >
-                                {switchingAccount
-                                  ? t('row.accountsScanning')
-                                  : t('row.credentialRejectedSwitchAction', { accountName: nameOf(status.recovery.usableAccount.accountName) })}
-                              </button>}
-                        </section>
-                      : null}
+                    {credentialRefusedBlock}
                     {status.creditsError === undefined ? null
                       : <p className="dsm-workbuddy-usage-error">{t('row.creditsError', { message: status.creditsError })}</p>}
                     {/* Credits about to lapse, for the account this region is
@@ -4017,6 +4118,45 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
                           says nothing. */}
                       {sweepSummary === undefined ? null
                         : <p className="dsm-workbuddy-models-sweep-summary" role="status">{sweepSummary}</p>}
+                      {/* THE DIRECTORY IS A PARTIAL ANSWER (issue #288).
+                          Without this notice a rate limit that made one product
+                          document unreadable looked exactly like "the upstream
+                          only offers this one model" — and the user could not
+                          tell which of the two they were looking at. The
+                          upstream's own words are quoted, because the recovery
+                          time is stated in them and nowhere else. */}
+                      {catalogDegraded === undefined ? null
+                        : (
+                          <div className="dsm-workbuddy-models-degraded" role="status">
+                            <p className="dsm-workbuddy-models-degraded-line">
+                              {t('row.catalogDegraded', {
+                                missing: t(catalogDegraded.missing === 'cli'
+                                  ? 'row.catalogSourceCli'
+                                  : catalogDegraded.missing === 'legacy'
+                                    ? 'row.catalogSourceLegacy'
+                                    : 'row.catalogSourceApp'),
+                                used: t(catalogDegraded.used === 'cli'
+                                  ? 'row.catalogSourceCli'
+                                  : catalogDegraded.used === 'legacy'
+                                    ? 'row.catalogSourceLegacy'
+                                    : 'row.catalogSourceApp'),
+                                reason: catalogDegraded.reason,
+                              })}
+                            </p>
+                            {catalogDegraded.resetAtMs === undefined ? null
+                              : (
+                                <p className="dsm-workbuddy-models-degraded-line">
+                                  {t('row.catalogDegradedReset', { at: formatShortClock(catalogDegraded.resetAtMs) })}
+                                </p>
+                              )}
+                            {carriedModelIds.length === 0 ? null
+                              : (
+                                <p className="dsm-workbuddy-models-degraded-line">
+                                  {t('row.catalogDegradedCarried', { models: carriedModelNames.join('、') })}
+                                </p>
+                              )}
+                          </div>
+                        )}
                       <div className="dsm-workbuddy-model-list">
                         {visibleModels.map(model => (
                           <div className={`dsm-workbuddy-model${activeEnabledIds.has(model.id) ? '' : ' dsm-workbuddy-model-disabled'}`} key={model.id}>
@@ -4554,6 +4694,12 @@ function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation
                           the detail. */}
                       {signedOutText(notice, t)}
                     </p>
+                    {/* Issue #285: when the token was refused during REFRESH, the
+                        region is still `signed-out` but its accounts are present.
+                        Show the same switch/re-login advice the signed-in branch
+                        uses, so a healthy local account becomes the one-click
+                        fix instead of an invisible option behind "未登录". */}
+                    {credentialRefusedBlock}
                     {/* Re-detect stays HERE as well, not only in the pool block:
                         the pool renders for a signed-in region only, and "I just
                         signed in over there, look again" is precisely a

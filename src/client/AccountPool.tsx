@@ -112,6 +112,10 @@ export interface PoolPreferences {
    * claims a background job is running before the write landed.
    */
   autoCheckin: boolean
+  /** Auto-redeem claimable growth tiers (issue #286). Draft, opt-in. */
+  growthRedeem: boolean
+  /** Auto-light "active today" via ACP (issue #286). Draft, opt-in. */
+  growthActivity: boolean
   /**
    * Per-account test model, keyed by account id (issue #61).
    *
@@ -295,6 +299,38 @@ function formatNumber(value: number): string {
   return formatCredits(value)
 }
 
+/**
+ * One small line-icon for a day-state stamp (issue #286): check = checked in,
+ * gift = tier redeemed, bolt = active today. Drawn inline with `currentColor`
+ * so the green CSS token carries through; `aria-hidden` because the wrapping
+ * span already carries role=img + aria-label + title tooltip.
+ */
+function dayStateIcon(kind: 'check' | 'gift' | 'bolt'): ReturnType<typeof h> {
+  const shared = {
+    width: 12,
+    height: 12,
+    viewBox: '0 0 16 16',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.6,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true,
+    focusable: 'false',
+  }
+  if (kind === 'check') {
+    return h('svg', shared, h('path', { d: 'M3 8.5l3.2 3.2L13 5' }))
+  }
+  if (kind === 'gift') {
+    return h('svg', shared,
+      h('rect', { x: 2.5, y: 6.5, width: 11, height: 7, rx: 1 }),
+      h('path', { d: 'M2 6.5h12M8 6.5V13.5' }),
+      h('path', { d: 'M8 6.5C6 6.5 5 6 5 4.8c0-.9.9-1.5 1.8-1.2C8 4 8 6.5 8 6.5zM8 6.5c2 0 3-.5 3-1.7 0-.9-.9-1.5-1.8-1.2C8 4 8 6.5 8 6.5z' }),
+    )
+  }
+  return h('svg', shared, h('path', { d: 'M9 2L4 9h3.2L6.5 14 12 7H8.8L9 2z' }))
+}
+
 function formatClock(value: number): string {
   return new Intl.DateTimeFormat(undefined, {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -325,7 +361,7 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
   // A stale re-read after a VERIFIED write — a different fact from a failed
   // save, and it must not borrow the 「保存失败：」 framing (issue #131).
   const [staleNotice, setStaleNotice] = useState<string | undefined>(undefined)
-  const [busy, setBusy] = useState<'checkin' | 'test' | undefined>(undefined)
+  const [busy, setBusy] = useState<'checkin' | 'test' | 'growth-redeem' | 'growth-activity' | undefined>(undefined)
   const [actionError, setActionError] = useState<string | undefined>(undefined)
   // Seeded from the shared store so a remount continues the same history.
   const [log, setLog] = useState<readonly PoolLogEntry[]>(() => logStore.get(region) ?? [])
@@ -385,6 +421,8 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
     // Absent reads as OFF: this switch authorises a real WRITE on the user's
     // account, so "the host could not answer" must never become "on".
     autoCheckin: pool?.autoCheckin === true,
+    growthRedeem: pool?.growthRedeem === true,
+    growthActivity: pool?.growthActivity === true,
     // Copied verbatim (issue #61), including entries whose model has left the
     // catalog: the host keeps them for the same reason, and dropping one here
     // would make the next Save delete the user's choice.
@@ -427,6 +465,8 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
     // accounts, so flipping it must go through Save like every other field here
     // rather than taking effect on the click.
     || draft.autoCheckin !== saved.autoCheckin
+    || draft.growthRedeem !== saved.growthRedeem
+    || draft.growthActivity !== saved.growthActivity
   )
 
   /**
@@ -733,7 +773,7 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
   }, [editDraft, pool])
 
   /** Run one batch action against the Host. */
-  const runAction = useCallback(async (action: 'checkin' | 'test'): Promise<void> => {
+  const runAction = useCallback(async (action: 'checkin' | 'test' | 'growth-redeem' | 'growth-activity'): Promise<void> => {
     setBusy(action)
     setActionError(undefined)
     // Count what the batch will ACTUALLY run on — the same set the Host itself
@@ -759,7 +799,11 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
     appendLog(
       action === 'checkin'
         ? t('row.poolLogCheckinStart', { count: memberCount })
-        : t('row.poolLogTestStart', { count: memberCount, model: pool?.targetModelId ?? '' }),
+        : action === 'growth-redeem'
+          ? t('row.poolLogGrowthRedeemStart', { count: memberCount })
+          : action === 'growth-activity'
+            ? t('row.poolLogGrowthActivityStart', { count: memberCount })
+            : t('row.poolLogTestStart', { count: memberCount, model: pool?.targetModelId ?? '' }),
       'info',
     )
     /**
@@ -862,7 +906,26 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
           }))
         }
         if (!mounted.current) return
-        if (action === 'checkin') {
+        if (action === 'growth-redeem' || action === 'growth-activity') {
+          for (const row of (body?.rows ?? []) as WorkBuddyWebPoolCheckinRow[]) {
+            const name = row.accountName === '' || row.accountName === undefined
+              ? t('row.accountUnnamed')
+              : row.accountName
+            if (row.status === 'claimed') {
+              appendLog(t(action === 'growth-redeem' ? 'row.poolLogGrowthRedeemDone' : 'row.poolLogGrowthActivityDone', {
+                accountName: name,
+                credit: row.credit === undefined ? '' : ` +${row.credit}`,
+              }), 'ok')
+            } else if (row.status === 'already') {
+              appendLog(t('row.poolLogGrowthAlready', { accountName: name }), 'info')
+            } else if (row.status === 'skipped') {
+              appendLog(t('row.poolLogGrowthSkipped', { accountName: name }), 'info')
+            } else {
+              appendLog(t('row.poolLogGrowthFailed', { accountName: name, message: row.message ?? t('row.requestFailed') }), 'error')
+            }
+          }
+          appendLog(t(action === 'growth-redeem' ? 'row.poolLogGrowthRedeemBatchDone' : 'row.poolLogGrowthActivityBatchDone'), 'ok')
+        } else if (action === 'checkin') {
           for (const row of (body?.rows ?? []) as WorkBuddyWebPoolCheckinRow[]) {
             if (row.status === 'claimed') {
               appendLog(t('row.poolLogCheckinClaimed', {
@@ -1519,6 +1582,47 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
             autoCheckinStatus,
           )
         : null,
+      // GROWTH CENTER (issue #286): two opt-in background jobs, BOTH regions.
+      // Same DOM shape as the check-in switch, same "draft until Save" rule. Kept
+      // separate from check-in because the growth API exists in both regions —
+      // the international account has no check-in but DOES have these rewards.
+      h('div', { className: 'dsm-workbuddy-pool-auto-checkin' },
+        h('div', { className: 'dsm-workbuddy-pool-switchrow' },
+          h('label', { className: 'sw' },
+            h('input', {
+              type: 'checkbox',
+              checked: active.growthRedeem,
+              disabled: !canEditPool,
+              onChange: (event: { currentTarget: { checked: boolean } }) => {
+                // Capture the value synchronously: React nulls `currentTarget`
+                // before the queued editDraft updater runs. Reading it inside
+                // the updater throws "Cannot read properties of null (checked)".
+                const next = event.currentTarget.checked
+                editDraft(current => ({ ...current, growthRedeem: next }))
+              },
+            }),
+            h('span', { className: 'sw-track' }),
+          ),
+          h('b', { className: 'dsm-workbuddy-pool-modebar-label' }, t('row.poolGrowthRedeem')),
+        ),
+        h('p', { className: 'dsm-workbuddy-pool-note' }, t('row.poolGrowthRedeemHint')),
+        h('div', { className: 'dsm-workbuddy-pool-switchrow' },
+          h('label', { className: 'sw' },
+            h('input', {
+              type: 'checkbox',
+              checked: active.growthActivity,
+              disabled: !canEditPool,
+              onChange: (event: { currentTarget: { checked: boolean } }) => {
+                const next = event.currentTarget.checked
+                editDraft(current => ({ ...current, growthActivity: next }))
+              },
+            }),
+            h('span', { className: 'sw-track' }),
+          ),
+          h('b', { className: 'dsm-workbuddy-pool-modebar-label' }, t('row.poolGrowthActivity')),
+        ),
+        h('p', { className: 'dsm-workbuddy-pool-note' }, t('row.poolGrowthActivityHint')),
+      ),
     ),
 
     // "In use" and "in the pool" are orthogonal, and the row cannot say both
@@ -1656,6 +1760,23 @@ export function AccountPool(props: AccountPoolProps): ReturnType<typeof h> | nul
                 onClick: () => { void runAction('checkin') },
               }, busy === 'checkin' ? t('row.poolCheckingIn') : t('row.poolCheckinAll'))
             : null,
+          // Growth "run now" buttons (issue #286). Both regions, both manual —
+          // deliberately NOT gated on the opt-in switches: a click is the user
+          // explicitly asking to run it once, which is independent of the timer.
+          h('button', {
+            type: 'button',
+            className: 'dsm-btn dsm-btn-outline',
+            disabled: busy !== undefined || effectiveMembers.length === 0,
+            title: t('row.poolGrowthRedeemRunHint'),
+            onClick: () => { void runAction('growth-redeem') },
+          }, busy === 'growth-redeem' ? t('row.poolGrowthRedeemRunning') : t('row.poolGrowthRedeemRun')),
+          h('button', {
+            type: 'button',
+            className: 'dsm-btn dsm-btn-outline',
+            disabled: busy !== undefined || effectiveMembers.length === 0,
+            title: t('row.poolGrowthActivityRunHint'),
+            onClick: () => { void runAction('growth-activity') },
+          }, busy === 'growth-activity' ? t('row.poolGrowthActivityRunning') : t('row.poolGrowthActivityRun')),
           h('button', {
             type: 'button',
             className: 'dsm-btn dsm-btn-outline',
@@ -2228,6 +2349,40 @@ function renderAccountRow(input: {
         ? h('span', { className: 'dsm-workbuddy-pool-soon' },
             t('row.poolCreditSoon', { count: formatNumber(account.expiringSoon) }))
         : null,
+      // All three day-state stamps together beside the credits (issue #286), as
+      // ICONS with no text: ✔ check-in, 🎁 redeemed, ⚡ active. Each carries a
+      // `title` tooltip so hover still says what it means (reusing the existing
+      // label strings — no new translations). Only successful states appear; an
+      // untouched account shows nothing. Icons are aria-labelled for screen
+      // readers even though the visual text is gone.
+      account.checkedInToday === true || account.growthRedeemedToday === true || account.growthActiveToday === true
+        ? h('span', { className: 'dsm-workbuddy-pool-daystamps' },
+            account.checkedInToday === true
+              ? h('span', {
+                  className: 'dsm-workbuddy-pool-daystamp',
+                  title: t('row.poolCheckedIn'),
+                  role: 'img',
+                  'aria-label': t('row.poolCheckedIn'),
+                }, dayStateIcon('check'))
+              : null,
+            account.growthRedeemedToday === true
+              ? h('span', {
+                  className: 'dsm-workbuddy-pool-daystamp',
+                  title: t('row.poolGrowthRedeemed'),
+                  role: 'img',
+                  'aria-label': t('row.poolGrowthRedeemed'),
+                }, dayStateIcon('gift'))
+              : null,
+            account.growthActiveToday === true
+              ? h('span', {
+                  className: 'dsm-workbuddy-pool-daystamp',
+                  title: t('row.poolGrowthActive'),
+                  role: 'img',
+                  'aria-label': t('row.poolGrowthActive'),
+                }, dayStateIcon('bolt'))
+              : null,
+          )
+        : null,
       // Claimable benefits (issue #79). Rendered ONLY when there is at least one:
       // a claimed campaign and a lapsed one both arrive here ABSENT, so the line
       // disappears by itself once nothing is left to take — that absence is the
@@ -2388,25 +2543,22 @@ function renderAccountRow(input: {
     // identity line), which meant a screen reader reached 「已签到」 before the
     // verdict it belongs with while the eye met it after. Now the DOM order is the
     // visual order on that line: verdict → check-in → buttons.
+    // The check-in cell stays as a GRID CELL (the template names its area), but
+    // the successful 已签到 stamp now lives with the other two in the credits
+    // column — the user asked for all three state stamps together, beside the
+    // credits. What remains here is only the NOT-done / unread hints, which are
+    // the actionable half ("you should check in") rather than a duplicate stamp.
     checkinSupported
       ? h('span', { className: 'dsm-workbuddy-pool-checkin' },
-          // Enterprise accounts have no consumer check-in at all (issue #129):
-          // showing 「未签到」 would tell them to perform an action the upstream
-          // already refuses with `10001`, which reads as their own mistake.
           account.enterprise === true
             ? h('span', { className: 'dsm-workbuddy-pool-unknown' }, t('row.poolCheckinEnterprise'))
-            // Three states, not two: an unread account says nothing rather than
-            // claiming "not checked in", which would contradict a check-in the user
-            // just watched succeed.
             : account.checkedInToday === undefined
               ? h('span', { className: 'dsm-workbuddy-pool-unknown', title: t('row.poolNeverTested') },
                   t('row.poolCheckinUnknown'))
               : account.checkedInToday
-                ? h('span', { className: 'dsm-workbuddy-pool-checked' }, t('row.poolCheckedIn'))
+                ? null
                 : t('row.poolNotCheckedIn'),
         )
-      // Absent entirely where the region has no check-in: an empty column would
-      // still imply the state exists and is merely unknown.
       : null,
     // Per-row actions, LAST cell of the row: test this one account, and forget
     // this account's plugin-stored credential. The test reuses the batch's
