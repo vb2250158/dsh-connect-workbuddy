@@ -1,5 +1,73 @@
 # Changelog
 
+## 5.31.4-fork.1 (2026-11-25)
+
+- 合入上游 5.31.3 和 5.31.4 的渠道提示处理修复。保留积分和账号余额 HTTP 路由的宿主鉴权。
+
+## 5.31.4 (2026-11-24)
+
+> 兼容版：修复 DSH 0.2.3 起宿主侧读 `/usage` 稳定 401（#294），并补上渠道门改词表漏掉的一句 first-party 系统提示（#293/#295）。
+
+> ⚠️ 本版在 5.31.3 发布之后新增，须单独发布。
+
+- **issue #294（宿主侧 401）**：`@deepseek-ai/dsh-host-webserver` 从 `0.2.3-alpha.1` 起给插件路由加了
+  `auth` 选项、**默认 `required`**；本插件所有路由共用 `raw()` 骨架，没传 `auth`，于是宿主进程用
+  进程内 `fetch`（不带浏览器会话 cookie）读 `/usage` 稳定 401，桌面卡片却正常。实测 0.2.2 的
+  `lib/index.js` 是 26614 字节、完全没有 auth 机制；0.2.3-alpha.1/.2 是 29752 字节、`authPolicy`
+  默认 `required`——代码与报告一致。
+- **修法**：`raw()` / `endpointRegion()` 透传可选 `auth`（0.2.2 的类型没有这个字段，用条件展开传，
+  那份宿主在运行时忽略多余键，无需 peer 变更或版本分支），**只给两条宿主会读的只读路由**
+  `usage` / `account-credits` 标 `auth: 'anonymous'`。两条路由本来就在骨架里跑 `requireLoopback()`，
+  所以远程调用方照样 403——这是把既有准入事实写明，不扩大攻击面。所有写路由保持默认 `required`
+  （用户点击的凭据是浏览器 cookie，不该被进程内调用方冒领）。
+- **issue #293 / #295（11128 渠道校验）**：
+  - #293 的 Claude Code `official CLI` 家族已在 5.31.3 修复；报告者后续在 `dsh-harness-dev-context`
+    的 `HARNESS_SOURCE_PROMPT` 里定位到**另一句** first-party 提示
+    `The runtime context names the DeepSeek Harness implementation checkout.`，它在 5700+ 字的 system
+    消息中段、紧挨 #167 已覆盖的 Web GUI 段落，而网关按「正文任意位置精确子串」匹配——中性头与
+    两轮零宽扰动都救不了。报告者本地改源码验证：改掉这句后拒绝消失。
+  - 本版把同一句加进 `CHANNEL_GATE_PHRASES`（意思是保持的改写：`implementation checkout` → `local
+    implementation checkout`），正式包里生效，不再依赖用户改 node_modules。
+  - 报告者最终用宿主的 `personaPrefix` / `includeHarnessIdentity` / `includeRuntimeContext` 源配置彻底
+    解决；他那句 `You are a coding agent running on the <model> model.` 本表已覆盖（实测确认），所以
+    真正漏的是上面那一句。
+- **测试**：新增 `tests/issue293-runtime-context-sentence.spec.ts`（4 条：清掉该句、幂等、不留零宽
+  字符、经 `prepareChatBody` 上到 wire）与 web-status 的准入断言（仅两条读路由 anonymous，其余
+  写路由保持 required）。两处变异验证均咬住：runtime-context 行永不命中 → 2 条红；`raw()` 不透传
+  auth / `usage` 不给 anonymous → 各 1 条红。
+- `pnpm run check` 全过（3817 条测试）。Host 侧改动，需重启 DSH 加载。
+
+## 5.31.3 (2026-11-24)
+
+> 修复版：Claude Code 的 `official CLI` 自述句补上改词规则，解决贴图之外的 11128 渠道校验硬失败（#293）。
+
+> ⚠️ 本版在 5.31.2 发布之后新增，须单独发布。
+
+- **issue #293**：Claude Code 客户端发来的 system 消息自带
+  `You are Claude Code, Anthropic's official CLI for Claude, …`，这一句**早已在**
+  `UNAPPROVED_CHANNEL_OPENINGS` 实测名单里（中英两区都 400 / 11128），却没有对应的**改词**规则：
+  - `CHANNEL_GATE_PATTERNS` 的两条形态行锁的是「身份 + **创造动词**（released/made/built/…）+ 厂商」，
+    这句用的是 `Anthropic's official CLI for Claude`，**没有创造动词**，两条都不命中；
+  - `forceNeutralHead` 只把开头挪到中性头之后，而网关对这句做的是「正文任意位置精确子串」匹配
+    （#125/#533），挪开头无效；
+  - 两轮零宽扰动也够不到中段：整句只有两个逗号有 `([,;])\s+` 插入点，且 #167 实测网关会先归一化
+    零宽字符再匹配。
+  ⇒ 三级救援阶梯对这句全部无效，带完整 Claude Code system 上下文的请求必然 11128。
+- **修法**：给 `CHANNEL_GATE_PATTERNS` 补第三条形态行，锁 `X 的 <厂商>'s official CLI for Y`
+  （不是只钉死某一句字面，换版本/换产品/换厂商仍覆盖），整句吞掉、不留 `agent's …` 残句，幂等。
+- **测试**：新增 `tests/issue293-official-cli-gate.spec.ts`（5 条：命中矩阵 / 放过普通散文 / 整句吞掉无残句 /
+  幂等 / `prepareChatBody` 只改 system 与 assistant）；变异验证（让该行永不命中）→ 3 条红。
+  另修正两处旧测试里「Claude Code 指纹原样保留在中性头之后」的断言——那正是 #293 报告的 bug 行为。
+- **issue #292（倍率显示，已判定非代码 bug，未改价格逻辑）**：截图里的 `Deepseek-V4.1-Flash x0.00`
+  是国际 **CLI 通道**对 `deepseek-v4.1-flash` 的实时报价；官方 app 的 `0.11x` 属于**同名的另一 id**
+  `deepseek-v4.1-flash-sg`（app 通道 0.11 / CLI 通道 0.03）。两个 id 显示名完全相同，是 #280 已知的
+  「同名孪生」限制（加 id 后缀的尝试因选择器截断已撤回）。**0.11 从来不属于国际 `-flash` 这个 id**，
+  改双通道合并优先级对它无效，且会把 `-sg` 的错误地改成 0.11。唯一会显示旧价的情况是 CLI 读取被拒
+  后的降级合并（#288），此时卡片有琥珀色「目录降级」提示条。已在 issue 给出三条判据请报告者确认。
+- 顺带更正 `src/catalog.ts` 一处与实测相反的陈旧注释（曾写 CLI 通道不收录 `deepseek-v4.1-flash`，
+  实际是 CLI 独有、app 通道才有 `-sg` 同名行）。注释是项目资产，改行为时同步更新。
+- `pnpm run check` 全过（3812 条测试）。Host 侧改动，需重启 DSH 加载。
+
 ## 5.31.2-fork.1 (2026-11-24)
 
 - 合入上游图片预算和宿主进程检测修复。源码 Web 的单图上限维持 1 MiB。

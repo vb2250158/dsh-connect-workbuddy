@@ -2913,6 +2913,19 @@ const CHANNEL_GATE_PHRASES: readonly (readonly [string, string])[] = [
     'they mean this GUI.',
     'the interface described here is meant.',
   ],
+  // ISSUE #293 / #295: the first-party runtime-context section shipped by
+  // `dsh-harness-dev-context` (HARNESS_SOURCE_PROMPT) names the implementation
+  // checkout. It sits in the MIDDLE of a 5,700+ char system message, immediately
+  // before the Web GUI paragraph, and the gateway matches a fixed span anywhere
+  // in a scanned message (#125/#533) — not just at offset 0. A reporter isolated
+  // this sentence on the live CN gateway and confirmed that rephrasing it at
+  // source cleared a refusal the whole rescue ladder could not. The replacement
+  // keeps the meaning ("checkout" → "local implementation checkout") and is
+  // stable under rewrites.
+  [
+    'The runtime context names the DeepSeek Harness implementation checkout.',
+    'The runtime context names the local implementation checkout.',
+  ],
 ]
 
 /**
@@ -2965,6 +2978,31 @@ const CHANNEL_GATE_PATTERNS: readonly (readonly [RegExp, string])[] = [
     // 不认产品名只认厂商：换品牌仍能兜住。版本号里的点用 `\.(?=\d)` 放行，
     // 否则 "Claude 2.1.327" 会在 "2.1" 处被当成句末、整句漏掉。
     /^[ \t]*You are\s+(?:[^.\n]|\.(?=\d)){0,120}?\b(?:released|made|built|created|developed|trained|powered)\s+(?:by|on|from)\s+(?:xAI|Anthropic|OpenAI|Google(?:\s+DeepMind)?|Meta|Mistral)\b[^.\n]*/gm,
+    'You are an autonomous coding agent',
+  ],
+  [
+    // THIRD ROW: the "official CLI" shape (issue #293). The two rows above
+    // lock IDENTITY + a CREATOR VERB + a vendor. Claude Code's own head uses
+    // NO creator verb: "You are Claude Code, Anthropic's official CLI for
+    // Claude, running within the Claude Agent SDK." — so the vendor row misses
+    // it, and the Grok row is xAI-only. Yet that exact sentence is ALREADY on
+    // {@link UNAPPROVED_CHANNEL_OPENINGS} (measured 400/11128 on both gateways
+    // since 2026-10-21), so it is a KNOWN blocked phrase with no rewrite row.
+    //
+    // `forceNeutralHead` only moves an opening behind a neutral head; the gate
+    // matches the phrase as an EXACT SUBSTRING ANYWHERE (#125/#533), so moving
+    // offset 0 changes nothing. The two perturbation rungs cannot reach the
+    // middle either: only two commas in the whole sentence carry a `([,;])\s+`
+    // breakpoint, and the upstream normalises zero-width spaces before the
+    // substring match (#167). So a rewrite at the SOURCE is the only lever.
+    //
+    // Locks the SHAPE — product + "<vendor>'s official CLI for <product>" —
+    // so a version bump, a product rename or a vendor swap stays covered. The
+    // trailing `[^.\n]*` consumes the rest of the identity sentence INCLUDING
+    // the trailing period, so no `agent's Claude Agent SDK` torn tail remains.
+    // Anchored to a line start so ordinary prose merely mentioning a CLI does
+    // not change.
+    /^[ \t]*You are\s+[\w-]+(?:\s+[\w.]+)?\s*,\s*(?:xAI|Anthropic|OpenAI|Google(?:\s+DeepMind)?|Meta|Mistral)'s\s+official\s+CLI\s+for\s+[\w-]+\b[^.\n]*/gmi,
     'You are an autonomous coding agent',
   ],
 ]
