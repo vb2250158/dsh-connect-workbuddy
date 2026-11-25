@@ -35,6 +35,7 @@ import {
   prepareChatBody,
   modelIdOfBody,
   forceNeutralHead,
+  forceSystemHead,
   channelGateMemberOf,
   isConversationIdGateBody,
   isContextTooLongBody,
@@ -45,6 +46,7 @@ import {
   CONTEXT_OVERFLOW_MARKER,
   isFirstMessageGateBody,
   openingEvidenceOfBody,
+  channelFingerprintTrace,
   perturbChannelFingerprints,
   requestEvidenceOf,
   rewriteSessionTitleModel,
@@ -1236,14 +1238,14 @@ function clippedUpstreamText(text: string, limit: number): string {
  * WHAT THAT MARKER MAY NOT SAY (issue #213). It used to read 「网关可能新增了
  * 词条」, and a reporter read it as "this opening went out verbatim" — then
  * reported that the three `assistant` openings the gate had named were never
- * neutralised at all. They were: `forceNeutralHead` puts the head in front of
- * every scanned opening regardless of the list (since 4.15.1), so the request
- * that was refused for the third time had heads on all of them. The marker
- * describes the FIRST attempt and only the opening's FIRST LINE; the gateway
- * matches an exact substring anywhere in the text, so a first line that is
- * absent from the snapshot says nothing about the message as a whole. Both of
- * those are stated in the reply's closing sentence, which is the part a
- * reporter actually quotes back at us.
+ * neutralised at all. The marker describes the FIRST attempt and only the
+ * opening's FIRST LINE; the gateway matches an exact substring anywhere in
+ * the text, so a first line absent from the snapshot says nothing about the
+ * message as a whole. (Since #297 the common rescue adds the head to SYSTEM
+ * only, so a later refused attempt need not have heads on assistant openings
+ * at all — the blind all-role head is now the last rung.) Both facts are
+ * stated in the reply's closing sentence, which is the part a reporter
+ * actually quotes back at us.
  *
  * Capped at {@link CHANNEL_EVIDENCE_LIMIT} entries: a session can carry dozens
  * of system/assistant messages, and a wall of them would bury the one that
@@ -1267,6 +1269,32 @@ function channelEvidenceText(bodyJson: string): string {
   const hidden = entries.length - shown.length
   return `请求里被网关扫描的消息开头：${rendered}${hidden > 0 ? `……另有 ${hidden} 条未列出。` : '。'}`
 }
+
+/**
+ * ISSUE #311 — render the zero-privacy fingerprint trace as an APPENDED line.
+ *
+ * Counts and line numbers only, never message text. A reader can open their own
+ * transcript at the reported line and bisect the suspect sentence; a maintainer
+ * can see whether a known rewrite silently missed. Kept as a separate APPEND so
+ * every existing evidence assertion (which matches the prefix) still holds.
+ */
+function fingerprintTraceText(raw: string, prepared: string): string {
+  const trace = channelFingerprintTrace(raw, prepared)
+  const parts: string[] = []
+  for (const [index, perWord] of trace.occurrences) {
+    const words = [...perWord].map(([word, lines]) => `${word} ${lines.length} 处（行 ${lines.join('/')}${lines.length >= TRACE_LINE_CAP_HINT ? '…' : ''}）`)
+    parts.push(`消息 ${index}: ${words.join('，')}`)
+  }
+  if (trace.unrewrittenRows.length > 0) {
+    parts.push(`改词自检：${trace.unrewrittenRows.length} 条已知指纹仍留在发出的 body 里（改写表第 ${trace.unrewrittenRows.join('/')} 条）`)
+  } else {
+    parts.push('改词自检：全部已知指纹已从发出的 body 清除')
+  }
+  return `零正文指纹线索（仅计数与行号，不含正文）：${parts.join('；')}。`
+}
+
+/** Mirrors the trace's per-word line cap, for the "…" hint only. */
+const TRACE_LINE_CAP_HINT = 6
 
 /** How many message openings the channel-gate reply lists. */
 const CHANNEL_EVIDENCE_LIMIT = 4
@@ -1729,7 +1757,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     })
     if (controller.signal.aborted) return
 
-    let credential
+    let credential: WorkBuddyCredential
     try {
       credential = await store.resolve()
     } catch (error: unknown) {
@@ -1811,17 +1839,24 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
      * sends the same bytes, so without a rescue the only outcome is a dead end
      * the reader cannot get out of.
      *
-     * Two rungs, both on the SAME credential (the gate reads the request, not
+     * Four rungs, all on the SAME credential (the gate reads the request, not
      * the account, which is why `channel_reject` is not failover-worthy):
      *
-     *   1. `forceNeutralHead` — move every scanned opening behind the neutral
-     *      head. Measured: whatever the banned opening is, moving it off the
-     *      start of the content answers 200.
+     *   1. `forceSystemHead` — move the SYSTEM opening behind the neutral head.
+     *      Measured: whatever the banned opening is, moving it off the start of
+     *      the content answers 200. Only system is touched (issue #297): an
+     *      assistant head is copied by the model into future replies, so the
+     *      common rescue must not plant it in assistant history.
      *   2. `perturbChannelFingerprints` — insert zero-width spaces at the
      *      sentence boundaries of the scanned messages, which breaks an
      *      exact-substring fingerprint without changing a word the model reads.
      *      This is the rung that rescues the inside-the-prompt fingerprints,
      *      where rung 1 is a no-op.
+     *   3. dense `perturbChannelFingerprints` — same, at every word boundary,
+     *      for a fingerprinted prose span with no punctuation.
+     *   4. `forceNeutralHead` — the LAST resort: the blind, all-role head. Only
+     *      when 1–3 failed. This is the one that plants the persona line in
+     *      assistant history, so it is reserved for the unmeasured case.
      *
      * Both return `undefined` when they would change nothing; that is the
      * signal not to spend a request on a body that would be refused identically.
@@ -1832,47 +1867,106 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
      * as an account failure: it was the request that was refused, not the
      * credential.
      */
-    let retriedWithForcedHead = false
+    let retriedWithSystemHead = false
     let retriedWithPerturbation = false
     let retriedWithDensePerturbation = false
-    if (!result.ok && result.kind === 'channel_reject' && !controller.signal.aborted) {
-      const forced = forceNeutralHead(prepared)
+    let retriedWithBlindHead = false
+    /**
+     * The channel-gate rescue ladder, as a reusable step.
+     *
+     * ISSUE #302 / #307. This used to be an inline block that ran ONCE, on the
+     * first account's first answer only. But `channel_reject` is not failover-
+     * worthy (`isFailoverWorthy` excludes it), so the failover loop can still
+     * END on one: an account that answers 429/402/5xx is swapped for another,
+     * and THAT account's answer to the same body is a 11128. The ladder had
+     * already run (or been skipped) before the loop, so the final refusal —
+     * the one the user actually reads — never saw a rescue, and `retryNote`
+     * came back EMPTY even though the request was refused for a prompt reason.
+     *
+     * Making it a function lets the SAME ladder run again after failover, once,
+     * on the result the user will actually see. The `retried*` flags are shared
+     * so the second call is a no-op when the first already spent all three
+     * rungs — no extra request is sent for a body the ladder already tried.
+     */
+    const rescueChannelReject = async (
+      initial: WorkBuddyChatResult,
+    ): Promise<WorkBuddyChatResult> => {
+      if (initial.ok || initial.kind !== 'channel_reject' || controller.signal.aborted) return initial
+      let current: WorkBuddyChatResult = initial
+      // ISSUE #297: the first rung moves ONLY the system opening behind the
+      // neutral head. system is what the gateway's offset-0 gate reads and is
+      // not the model's own history, so this rescues the measured #98/#189
+      // shapes WITHOUT planting the persona line in assistant turns (which the
+      // model copies into future replies and the host persists).
+      const forced = forceSystemHead(prepared)
       if (forced !== undefined) {
-        logger?.warn('dsh-connect-workbuddy: the channel gate refused the body; retrying once with the neutral head forced in front of every opening')
-        result = await client.chatStream(credential, forced, controller.signal, sessionConversationId)
-        retriedWithForcedHead = true
+        logger?.warn('dsh-connect-workbuddy: the channel gate refused the body; retrying once with the neutral head on the system opening only')
+        current = await client.chatStream(credential, forced, controller.signal, sessionConversationId)
+        retriedWithSystemHead = true
       }
-      if (!result.ok && result.kind === 'channel_reject' && !controller.signal.aborted) {
+      if (!current.ok && current.kind === 'channel_reject' && !controller.signal.aborted) {
         const rescued = perturbChannelFingerprints(forced ?? prepared)
         if (rescued !== undefined) {
           logger?.warn('dsh-connect-workbuddy: the channel gate refused the body again; retrying once with an invisible perturbation of the scanned text')
-          result = await client.chatStream(credential, rescued, controller.signal, sessionConversationId)
+          current = await client.chatStream(credential, rescued, controller.signal, sessionConversationId)
           retriedWithPerturbation = true
           // THE PERTURBATION IS WHAT WORKED, so remember it: the next request
           // in this process starts perturbed and skips both doomed attempts.
           // Only set on SUCCESS — a perturbation that is also refused teaches
           // nothing about what the gateway wants.
-          if (result.ok) channelNeedsPerturbation = true
+          if (current.ok) channelNeedsPerturbation = true
         }
       }
       // The dense rescue is deliberately last: it is the least byte-conservative
       // form, and the gateway's own wording gives no hint that it would be needed.
       // It exists because both measured rungs are punctuation-dependent and a
       // fingerprinted prose span can contain no punctuation at all.
-      if (!result.ok && result.kind === 'channel_reject' && !controller.signal.aborted) {
+      if (!current.ok && current.kind === 'channel_reject' && !controller.signal.aborted) {
         const dense = perturbChannelFingerprints(forced ?? prepared, true)
         if (dense !== undefined) {
           logger?.warn('dsh-connect-workbuddy: the channel gate refused the sparse perturbation too; retrying once with a dense word-boundary perturbation')
-          result = await client.chatStream(credential, dense, controller.signal, sessionConversationId)
+          current = await client.chatStream(credential, dense, controller.signal, sessionConversationId)
           retriedWithDensePerturbation = true
           // Dense is the strongest form; remembering it is safe only for the
           // `failure` policy, which exists to learn from a successful rescue.
-          if (result.ok && channelPerturbation === 'failure') channelNeedsPerturbation = true
+          if (current.ok && channelPerturbation === 'failure') channelNeedsPerturbation = true
         }
       }
+      // ISSUE #297 — LAST rung: the blind, all-role neutral head. Reserved for
+      // the unmeasured case of an assistant opening that is neither in the
+      // prefix blacklist nor covered by the phrase rewrites. It is deliberately
+      // last because it is the one that plants the persona line in assistant
+      // history (#297): the model imitates its own past answers. If system-only
+      // and both perturbations already worked, this rung never runs, so a
+      // normal rescue leaves assistant history clean.
+      if (!current.ok && current.kind === 'channel_reject' && !controller.signal.aborted) {
+        const blind = forceNeutralHead(forced ?? prepared)
+        if (blind !== undefined) {
+          logger?.warn('dsh-connect-workbuddy: the system-only head and both perturbations were refused; retrying once with the neutral head forced in front of every opening (including assistant history)')
+          current = await client.chatStream(credential, blind, controller.signal, sessionConversationId)
+          retriedWithBlindHead = true
+        }
+      }
+      // #302: a ladder that entered the `channel_reject` branch but had nothing
+      // it could change used to be silent. Say so — "no rescue was possible"
+      // and "the rescue was skipped" are different facts to the reader.
+      if (!current.ok && current.kind === 'channel_reject'
+        && !retriedWithSystemHead && !retriedWithPerturbation && !retriedWithDensePerturbation && !retriedWithBlindHead) {
+        logger?.warn('dsh-connect-workbuddy: the channel gate refused the body, but no rescue transform could change it (every scanned opening already neutral); no retry was spent')
+      }
+      return current
     }
+    result = await rescueChannelReject(result)
 
     const triedAccountIds: string[] = []
+    /**
+     * How many accounts actually RECEIVED a chat request, including the final
+     * one. `triedAccountIds` alone UNDERCOUNTS by one when the loop ends on a
+     * channel_reject: the loop pushes an id before asking for the NEXT account,
+     * and a channel_reject is not failover-worthy, so the account that produced
+     * the final 11128 was never pushed. #302 / #307.
+     */
+    let attemptCount = 1
     /**
      * The account the request STARTED on, and the reason it was abandoned.
      *
@@ -1975,7 +2069,21 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       switchedFrom ??= describeAccount(credential)
       switchedBecause ??= failoverReasonText(result)
       credential = next
-      result = await client.chatStream(credential, prepared, controller.signal, sessionConversationId)
+      // #302 / #307: reuse the PREFERRED body, not the raw `prepared`. If the
+      // learned perturbation (or `always`) was in force, the first account's
+      // attempt already used it; re-sending the unperturbed bytes here would
+      // knowingly walk into the gate the plugin already knows is closed.
+      result = await client.chatStream(credential, preferred, controller.signal, sessionConversationId)
+      attemptCount += 1
+    }
+    // ISSUE #302 / #307: failover can END on a channel_reject even though it
+    // never STARTS from one (channel_reject is not failover-worthy). The ladder
+    // above ran on the FIRST account's answer, so this final answer had none.
+    // Run it once more on exactly the result the user will read. The shared
+    // retried* flags make this a no-op when the ladder already spent its rungs,
+    // so a single-account 11128 sends no extra request here.
+    if (!retriedWithSystemHead && !retriedWithPerturbation && !retriedWithDensePerturbation && !retriedWithBlindHead) {
+      result = await rescueChannelReject(result)
     }
     // The final attempt's failure — recorded only if the loop did not already
     // record it (it does not: the loop records each attempt as it starts the
@@ -1991,11 +2099,13 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       // account the user selected failing, and the user cannot tell whether the
       // fallbacks were even attempted.
       //
-      // `triedAccountIds` already holds every account that SERVED an attempt —
-      // the loop pushes each one before asking for the next — so its length IS
-      // the attempt count. Adding one here reported a phantom extra account.
-      const attempts = triedAccountIds.length
-      const note = attempts > 1 ? `（已尝试 ${attempts} 个账号）` : ''
+      // `attemptCount` counts every account that actually received a request.
+      // It starts at 1 (the selected account) and grows on each failover, so a
+      // final `channel_reject` — which ends the loop before the last account is
+      // pushed to `triedAccountIds` — is still counted. Using
+      // `triedAccountIds.length` here UNDERCOUNTED and hid the note entirely in
+      // the two-account 429→11128 case (#302 / #307).
+      const note = attemptCount > 1 ? `（已尝试 ${attemptCount} 个账号）` : ''
       // WHY THERE WAS NOWHERE ELSE TO GO. Asked only when the request actually
       // failed, so the success path never pays for it, and only when a POOL
       // SEARCH really ran — which is a different question from whether the host
@@ -2169,11 +2279,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         if (detail?.upstreamCode !== undefined) meta.push(`code ${detail.upstreamCode}`)
         if (detail?.requestId !== undefined) meta.push(`requestId ${detail.requestId}`)
         const stamp = meta.length === 0 ? '' : `（${meta.join('，')}）`
-        const evidence = channelEvidenceText(raw)
+        // ISSUE #311: append a zero-privacy fingerprint trace (counts + line
+        // numbers + rewrite self-check) so a middle-of-prompt match in a huge
+        // system can be bisected by the reader, without leaking any text.
+        const evidence = channelEvidenceText(raw) + fingerprintTraceText(raw, prepared)
         const retries: string[] = []
-        if (retriedWithForcedHead) retries.push('强制中性头')
+        if (retriedWithSystemHead) retries.push('system 中性头')
         if (retriedWithPerturbation) retries.push('一次不可见扰动')
         if (retriedWithDensePerturbation) retries.push('一次密集不可见扰动')
+        if (retriedWithBlindHead) retries.push('全消息中性头')
         const retryNote = retries.length === 0 ? '' : `，并已用${retries.join('与')}重试过`
         // ISSUE #113: WHICH MEMBER of the `11128` family this is, decided by the
         // plugin's OWN evidence rather than by the upstream's `msg` — which
@@ -2216,9 +2330,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           '该请求被 WorkBuddy 网关的渠道校验拦截，上游把它描述成「不是官方客户端发出的」，但那是误导性文案：' +
           '网关扫描每一条 system 与 assistant 消息（开头做前缀匹配，正文做精确子串匹配），与账号、积分、额度、网络都无关，换账号或换区域也不会改变结果。' +
           '插件已对已知的第三方 agent 指纹做归一化' + retryNote +
-          (retriedWithForcedHead
+          (retriedWithBlindHead
             ? '；这次重试里每一条被扫描消息都已经加了中性头，仍然被拒，说明卡点不在这些开头本身'
-            : '') +
+            : retriedWithSystemHead
+              ? '；这次重试只给 system 开头加了中性头（assistant 历史保持原样，避免模型模仿），仍然被拒'
+              : '') +
           '。上面标着「不在插件已知名单里」的，只说明该消息的首行不是已知指纹，既不表示这条消息没被处理，也不表示它一定有问题；' +
           '如果这些消息确实有问题，命中的更可能是中段的某一句。请把这条报错整段反馈到 issue 里——首行之外的线索只能从完整请求里找'
         writeOpenAIError(res, KIND_STATUS[result.kind], result.kind, message, hostErrorCode(result.kind))

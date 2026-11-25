@@ -1,5 +1,96 @@
 # Changelog
 
+## 5.31.8-fork.1 (2026-11-26)
+
+- 合入上游 5.31.5 至 5.31.8 的模型目录、凭据恢复、子路径访问和账号池修复。
+- 保留积分与账号余额接口的宿主鉴权，以及现有源码 Web 测试规则。
+
+## 5.31.8 (2026-11-26)
+
+> 修复版（#297 重开）：渠道救援的第一级只给 system 加中性头，assistant 历史不再被插件注入人格句、被模型模仿进回复并落盘；全消息盲加头降为末级兜底。
+
+> ⚠️ 本版在 5.31.7 发布之后新增，须单独发布。
+
+### 救援第一级只补 system 头（#297 重开）
+
+- **背景**：5.31.6 的出站剥离（`stripInjectedAssistantHeads`）只作用于普通请求；一旦触发 11128 救援，`forceNeutralHead` 会在已准备好的 body 上给**每条 assistant 消息重新加回人格头**，与出站剥离精确互逆——于是救援那一刻的污染是「每次必发」。报告者在 #297 关闭后明确反对结案："目前 5.31.7 仍不能防止 `You are a helpful assistant.` 的出现……仍需关注而非列入已解决"，已重开该 issue。
+- **定性**：报告者的 `Message begins.` 实验（换成无意义句子模型照抄）证明这是**模型模仿历史形状**，不是插件回写 transcript。核实网关 offset-0 门是**黑名单**不是白名单（实测 Kimi / Cursor / Gemini 开头全 200），assistant 只需要「开头不是被禁指纹」、不需要中性句开头——正常会话的 assistant 历史全是散文开头也全 200。给 assistant 加头是「用唯一通用手段换来的过宽实现」，不是网关要求。
+- **修法**：拆出 `forceSystemHead()`（只补 system，system 不是模型自己的历史、不会被模仿）作为救援**第一级**，保留 #98「不知道指纹也能救」的能力；`forceNeutralHead()`（全角色）降为**末级兜底**，只在 system-only 头 + 两级扰动全失败后才用。失败模式是「多花一发请求」而非死局。5.31.6 的出站剥离保留作已污染会话的止血带。
+- **明确否决两案**：①assistant 强制头改纯换行（`"\n<banned>"` 靠网关今天不 trim，是可收回的礼物，且 assistant 角色从未真机测过）；②随机化中性头（模仿的是形状不是语义，换句子治不了病，还打断 `startsWithNeutralHead` 幂等、`neutralized` 判定、出站剥离与提示词缓存，净负收益）。
+- **文案同步**：retryNote 区分「system 中性头」与末级的「全消息中性头」；「每一条被扫描消息都已经加了中性头」只在盲兜底真跑过时才说；`docs/DESIGN.md` 相关注释同步更新。
+- **测试**：新增 `tests/issue297-rescue-no-assistant-head.spec.ts`（4 条：`forceSystemHead` 只动 system + 幂等 + 全角色头仍可用、端到端确认救援重试里 assistant 无人格头而 system 有）；更新 `issue98-shim.spec.ts`（救援重试断言 assistant 不带头）、`shim-failover.spec.ts` 与相关文案断言。变异验证（第一级改回 `forceNeutralHead`）→ 端到端红。`pnpm run check` 全过（3845 passed + 2 skipped）。
+
+## 5.31.7 (2026-11-26)
+
+> 修复版：插件前端在反向代理子路径（如飞牛 NAS 的 `/app/dsh/`）下不再丢前缀，登录/刷新不再报 `Unexpected token '<'`（#314）；账号池删掉两行表头，不再看起来像错行（#313）。
+
+> ⚠️ 本版在 5.31.6 发布之后新增，须单独发布。
+
+### 删掉账号池的表头（#313）
+
+- 用户反馈账号池表头「账号/积分」在第一行、「状态/签到」在第二行，看起来像错行。核对后那其实是 5.20.x 引入的刻意两行网格（表头与数据行共用同一套 `grid-template-areas`），但既然它实际观感就是错行，按维护者裁定**直接删掉表头**。
+- 各值本身自描述（勾选框+账号名、积分数、判词行、按钮），没有表头也能读懂。删除范围：`AccountPool.tsx` 的表头 div、`styles.ts` / `series-layout.ts` 的表头样式、中英 locale 的四个 `poolColumn*` 键。
+- 测试：`pool-render.spec.tsx` 里所有「用 `[1]` 取第一条数据行」（索引 0 原是表头）改为 `[0]`，表头专项断言改为「不存在 .dsm-workbuddy-pool-row-head」。变异验证（把表头加回去）→ 红。`pnpm run check` 全过（3841 passed + 2 skipped）。
+
+### 子路径部署下的请求 URL（#314）
+
+- **现象**：通过飞牛 NAS 的统一网关用 `/app/dsh/` 访问 DSH 时，点扫码登录立刻报 `Unexpected token '<', "<!doctype "... is not valid JSON`。原因是插件前端把路由写死成 `fetch('/plugins/dsh-connect-workbuddy/...')`，浏览器解析成站点根，丢了 `/app/dsh` 前缀，请求被网关当成未知路径返回 HTML，`response.json()` 于是解析 `<!doctype html>` 失败。直连 `28000` 端口正常。
+- **根因与依据**：DSH 自己就是按 `document.baseURI` 拼 API 路径的（宿主的 `stream-client.ts` / `socket.ts` 用 `new URL(path.slice(1), document.baseURI)`）——所以聊天在子路径下能通、唯独插件路由不通。报告者的判断正确，这不是权宜之计而是宿主既有约定。
+- **修法**：新增 `src/client/request-url.ts` 的 `resolveRequestUrl(logical, base = document.baseURI)`，只返回 origin-relative 的 `pathname + search`（不换 origin，`credentials: 'same-origin'` 语义不变；解析失败/无 document 时原样返回），把 11 个文件、28 处插件路由 fetch 全部包一层。根路径（`127.0.0.1:28000`）与桌面 `dsh-app://app/` 部署下结果与旧行为逐字节相同；只有子路径部署会补上挂载前缀。
+- **服务端不需改**：Host webserver 路由注册的是绝对路径 shim 也走回环，网关剥掉前缀后正好命中；本问题纯粹在前端。
+- **测试**：新增 `tests/request-url.spec.ts`（6 条：根路径/桌面不变、子路径补前缀、query 保留且不换 origin、带 query/hash 的 base 与非法输入安全、源码守卫禁止新路由裸写 `/plugins/`/`fetch(path)`、`__save` 内联字面量也走 helper）。两处变异验证均咬住（裸 fetch → 守卫红；子路径逻辑去掉 → 3 条红）。`pnpm run check` 全过（3841 passed + 2 skipped）。
+- **已知边界（如实登记）**：修好 URL 后，若网关把 `Host` 头原样转发（`nas:5666`），插件的 `requireLoopback()` 仍可能回 403 `host-not-trusted`——这属于 #261 的 `trustedHosts` 配置范畴，需在飞牛侧或插件配置里加该域名，本版不覆盖。具体取决于网关是否重写 Host。
+
+## 5.31.6 (2026-11-25)
+
+> 修复版：assistant 历史不再被插件注入的中性头持续污染（#297）；11128 报错附上零隐私的指纹定位线索（#311）。
+
+> ⚠️ 本版在 5.31.5 发布之后新增，须单独发布。
+
+### 出站剥离插件自己注入的 assistant 中性头（#297）
+
+- **根因定性**：报告者给出决定性证据——被污染的 `You are a helpful assistant.` 是逐 token 从上游流到达的（落盘事件保留原始 chunk），且把头换成无意义的 `Message begins.` 后模型立刻照抄它。所以这是**模型模仿历史形状**，不是插件把请求体写回 transcript；插件代码里也确无 session 写入路径。
+- **修法（只做出站副本，不碰落盘）**：`prepareChatBody` 在改词之后、中和之前，剥掉 assistant 消息里由插件自己注入的 `You are a helpful assistant.\n\n` 头。收窄边界：只碰 assistant（`system` 的头是网关要的、且不是模型自己的历史；`user`/`tool` 不被扫，改用户的话没有依据）；只剥「头 + 空行」这一固定注入形状（用户真的要求这句开头时通常不带空行，不会被误删）；最多 8 层，剥空则保留原文。
+- **未采纳的部分（如实登记）**：报告者建议把 assistant 的强制头改成纯换行（`"\n<banned>"` 在 2026-10-21 返回 200）。仓库同处明确记着「靠网关当前宽松、不能当修法」，且 2026-10-29 已实测网关匹配行为变化（U+200B 被规范化），assistant 角色下从未测过。所以本版**不改救援头**，只切断普通请求里的模仿回路；救援那一级仍会给 assistant 加头（局限：每次 11128 的救援请求里模型仍可能当场再模仿一条），留待有真机探针证据再处理。
+- **测试**：新增 `tests/issue297-outbound-strip.spec.ts`（6 条：字符串/数组 text part、多层叠加、剥空保留、system/user/tool 不动、不含空行的真实散文不误剥、普通对话不变）；变异验证去掉剥离调用 → 3 条红。#98/#189 等既有渠道门测试 68 条全过，`pnpm run check` 3835 passed + 2 skipped。
+
+### 11128 报错附零隐私指纹线索（#311）
+
+- **背景**：报告者发现 5.31.4 的三行改词都命中并发到 wire，但 22~26 万字符的 system 仍被拒，怀疑网关把规则放宽到「身份句 + 品牌」或中段还有表外句子；指出 `channelEvidenceText` 只报首行+字数，中段命中时信息量为零。
+- **核实**：替换值有组合级真机 200 证据（#164/#189），不是从没验证过；但含品牌的替换行确实是整表防护最薄的字符串（既不在前缀名单、也不再被从句破坏命中），属「未被排除的残余风险」，无实测不改。`长度阈值`假设早被 #164 实测否定；22→26 万增长来自会话中途整段替换 system（工具注册表），关键是新增内容里有哪些句子，不是长度本身。
+- **修法（零隐私诊断）**：11128 错误文案**追加**一段「零正文指纹线索」——对每条被扫消息报固定身份/品牌词的**出现次数与行号**（不含任何正文），加一条改词自检（发出的 body 里还剩几条已知 `from`、是改写表第几条）。全程只有固定词表、计数、行号，可安全贴进公开 issue。追加式实现，既有证据断言不受影响。
+- **未采纳的部分（如实登记）**：报告者建议 opt-in 的「含正文 / 候选行 hash+前缀」本地落盘模式。能力更强但触及隐私敏感区（本仓库公开且发 npm），需单独设计默认关闭 + 本地 0600 文件 + 明确「不要粘贴」警告，本版不做。
+- **测试**：新增 `tests/issue311-fingerprint-trace.spec.ts`（4 条：品牌词按行计数且不返回正文、改词自检、不可解析 body 安全、端到端确认中段 canary 不泄漏）；变异验证去掉 trace 追加 → 红。既有证据测试 54 条全过。
+
+## 5.31.5 (2026-11-25)
+
+> 修复版：渠道网关在**账号切换之后**才拒 body 时，三级救援阶梯此前从未作用于那一次结果（#302/#307）；企业账号读模型目录被答成个人名册（#303）；网关 HTML 401 被误判成「token 吊销」并永久排除账号（#305）。README 补上了 11128 升级后仍被拒时从源头关身份注入的 workaround。
+
+> ⚠️ 本版在 5.31.4 发布之后新增，须单独发布。
+
+### 11128 的「缺 retryNote」家族（#302 / #307）
+
+- 报错文案里缺少「，并已用强制中性头重试过」，报告者据此推断「三级救援一步都没跑」。报告者的 **aborted 归因不成立**——本 shim 的 `signal` 只有 `res.on('close')` 一个来源，abort 后错误体根本写不回客户端，而用户确实收到了带 `requestId` 的 400 正文（#159 已实测定论）。真正的成因是**错位**：救援阶梯跑在 failover **之前**、只作用于首选账号的第一击；而 `channel_reject` 不可 failover，却可能成为 failover 之后的结果——首选账号先答 429/402/5xx 被换掉，新账号对同一份 body 答 11128，这时循环因 `channel_reject` 退出，阶梯早已跑完，最终用户读到的那次拒绝**从未经过救援**，`retryNote` 于是为空。
+- **修法**：把阶梯抽成可重入的 `rescueChannelReject()`，在 failover 循环**之后**、对用户实际读到的那个 `result` 再跑一次；三个 `retried*` 标志共享，单账号 11128 或阶梯已跑过时是 no-op，不多花请求。另把 failover 重试的 body 从 `prepared` 改为 `preferred`（沿用已学到的扰动，不再明知会被拒还重发原始字节），并给「阶梯进了分支但无可改」补一条 warn（此前静默）。
+- **顺带修计数**：「（已尝试 N 个账号）」此前用 `triedAccountIds.length`，而循环只在**离开**账号时压入 id，最后一次 `channel_reject` 结束时那个账号从未入列——两账号 429→11128 场景实际发 2 个请求，文案却一个都不显示。改为显式 `attemptCount`（首选 1 + 每次换号 +1）。
+- **测试**：新增 `tests/shim-failover.spec.ts` 一条端到端回归（先 429 再 11128，断言阶梯跑过、`retryNote` 含「强制中性头」、且显示「已尝试 2 个账号」）。**变异验证**：去掉 failover 后的二次救援 → 红；计数退回 `triedAccountIds.length` → 红。`pnpm run check` 全过（3822 passed + 2 skipped）。Host 侧改动，需重启 DSH。
+
+### 网关 HTML 401 不再被误判成 token 吊销（#305）
+
+- **现象**：同一 token 在 `/v2/plugin/account` 与 billing `get-user-resource` 都 200，但探活拿到 APISIX 的 HTML 401，插件把它一律归成 `credential-rejected`、永久排除账号（无冷却、无自动复测），且文案断言「token 已不被上游接受、请重新登录」——换号只会换成另一个被标。
+- **根因**：`outcomeOfFailure`（`src/probe.ts`）把所有 401/403 折叠成 `credential-rejected`，而 `classifyUpstreamError` 对同一份 HTML 401 给出的其实是 `client`——探活与真实聊天请求对同一应答给出了不同判断。网关边缘 HTML 401 只能证明「这条路由在网关层被拒」，不能证明「token 被吊销」：仓库记录过同一张 HTML 页的三种成因（未带 token / 选到失效备份凭据 / token 发错品牌域）。唯一确凿的吊销信号是业务 JSON 的 `12153` / `Offline user session not found`，或 **refresh 跳**的 401/403。
+- **修法**：`outcomeOfFailure` 把含 openresty / APISIX / authorization-required 标记的 HTML 401/403 归为可冷却的 `failed`（账号在 cooldown 后自动恢复候选），`session_dead` 与无标记的 401 仍保持 `credential-rejected`。`isGatewayAuthRejection` 导出供 probe 使用，注释更正了此前「几乎总是吊销 token」的错误假设。
+- **自愈**：`reconcilePoolCredits` 现在也清除 `credential-rejected` 记录——一次**实时** `fetchCredits` 读回正余额，直接证伪「token 被拒」（有余额说明上游认了这把 token）。此前该记录 sticky 且被一条测试钉住「余额不清 credential-rejected」，那条测试把「余额到账不能证明模型可用」（对）错误地推广到了「也不能证明 token 有效」（错），已修正并拆分。
+- **测试**：probe 分类新增网关 401 / 无标记 401 / 真吊销 JSON 三种断言；pool store 新增「credential-rejected 遇实时正余额被清 / 零或失败余额保留」。两处变异验证均咬住。`pnpm run check` 全过（3825 passed + 2 skipped）。
+
+### 企业账号目录身份头（#303，PR #304）
+
+- **企业账号读模型目录被答成个人名册，`cli` 名册缺行**：`/v3/config` 是**按账号作答**的，官方客户端的 REST 层给每个出站请求（配置读也在内）盖 `X-User-Id` / `X-Enterprise-Id` / `X-Tenant-Id`（有 `domain` 时再加 `X-Domain`）。本插件三处目录读取（国内模型、国际两通道、媒体）此前**未带企业身份头**（国际两通道已带 `X-User-Id` / `X-Domain`，国内与媒体则只带 bearer token），企业成员账号因此被网关答成个人名册。实测 2026-11-25，国内区、`ultimate` 企业账号：`cli` 名册缺 5 行（`glm-5.4`、`glm-5.3-flashx`、`minimax-m3-pay`、`kimi-k3.1-pro-highspeed`、`kimi-k3-2`、`kimi-k2.5` 中的 5 个），而 app 的选择器在同一账号上当时就有它们。
+- **修法**：新增 `catalogIdentityHeaders()`，三处目录读取（含国内区回落到旧目录 `/v2` 的那一次）统一带齐账号身份头；UA、`X-Product`、`Origin` / `Referer` 等一律不变，归属头（`X-Device-Token` 一类）照旧不加——账号身份头回答「问的是哪个账号的名册」，归属头回答「谁在问」，`docs/DESIGN.md` 的「元数据读字节保持 5.16.0」同步改成这一例外。
+- **这套头要么齐发、要么都不发**：实测同一账号只发 `X-Enterprise-Id` 不发 `X-User-Id`，网关答的文档 `cli` 名册为空，读取解析成空名单、区域降级到旧目录——比不加更糟。因此做成一个整体的 helper，企业头整块以 `uid` 非空为前提（`uid === ''` 是可达状态，此时连企业头一起不发），而不是两处各加一行。
+- 个人账号（无 `enterpriseId`）：不发明 `X-No-Enterprise-Id`（那是 chat 的 CLI 约定，配置读上从未观察到），企业头直接不发；国内与媒体路径现在会补上 `X-User-Id` / `X-Domain`（此前未带）。
+- **测试**：新增 6 条回归（企业账号名册与四头齐全 / 旧目录回落同样带头 / 媒体目录带头 / 国际两通道都带 / 个人账号不带企业头 / `uid` 为空时整块企业头不发），变异验证见 PR。`pnpm run check` 全过。Host 侧改动，需重启 DSH 加载。
+
 ## 5.31.4-fork.1 (2026-11-25)
 
 - 合入上游 5.31.3 和 5.31.4 的渠道提示处理修复。保留积分和账号余额 HTTP 路由的宿主鉴权。

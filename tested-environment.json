@@ -7,7 +7,7 @@
   "pnpm": "11.28.5",
   "core": {
     "repository": "vb2250158/deepseek-harness",
-    "commit": "b071839b9a76fd23a581541d0f3b2b4184430831",
+    "commit": "7e2815dbdcf752f4ebb2db5fd61cf67319200025",
     "version": "0.2.3-alpha.2"
   },
   "installation": "Fixed Git commit with prepare. Source Web smoke links the built candidate using the declared host.",

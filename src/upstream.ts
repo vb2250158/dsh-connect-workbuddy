@@ -2401,6 +2401,54 @@ async function resolveWireIdentity(identity: WorkBuddyWireIdentity): Promise<Wor
   return { ...identity, deviceSalt: readout.salt }
 }
 
+/**
+ * Account identity headers for the catalog reads (`fetchModels` / `fetchMediaModels`).
+ *
+ * `/v3/config` answers PER ACCOUNT, and the account is named by the request:
+ * the official app's REST layer stamps `X-User-Id` + `X-Enterprise-Id` +
+ * `X-Tenant-Id` (+ `X-Domain`) on EVERY outgoing request, the config read
+ * included, so the app is always answered as the signed-in member. This plugin
+ * read the directory with a bearer token alone, and on an enterprise account
+ * that is a DIFFERENT question: the gateway fell back to the personal roster,
+ * which listed none of the enterprise-only rows (measured 2026-11-25, CN
+ * gateway, an `ultimate` account — five `cli`-agent rows were missing,
+ * including a GA model the app offered in its own selector on the same
+ * account minutes earlier).
+ *
+ * The headers travel TOGETHER or not at all. Sending `X-Enterprise-Id` without
+ * `X-User-Id` is worse than sending neither: measured on the same account, the
+ * gateway then answered a document whose `cli` agent had NO models, so the
+ * read resolved to an empty roster and the region degraded to the legacy
+ * directory. Hence one helper for the whole set, and hence `X-Tenant-Id` is
+ * included even though nothing observed required it — it is what the official
+ * client sends, and a partial imitation of a working request is how the empty
+ * roster above was produced.
+ *
+ * `uid`/`enterpriseId` are `undefined` when the credential carries neither and
+ * `''` only when the app wrote an empty value; both mean "absent", and absent
+ * means the header is simply omitted (`chatHeaders` sends the `X-No-*` form
+ * instead, but those are the CLI's chat conventions and were never observed on
+ * the config read).
+ *
+ * THE ENTERPRISE BLOCK IS GATED ON `uid` TOO. `uid === ''` is a reachable
+ * state (`auth.ts` writes `uid: identity['uid'] ?? ''`), so an enterprise
+ * credential with an empty uid would otherwise send `X-Enterprise-Id` /
+ * `X-Tenant-Id` WITHOUT `X-User-Id` — exactly the partial shape that the
+ * measurement above proved yields an empty `cli` roster. The "together or not
+ * at all" rule therefore lives in the CONDITION, not just in this comment:
+ * no uid means no enterprise block either.
+ */
+function catalogIdentityHeaders(credential: WorkBuddyCredential): Record<string, string> {
+  const hasUser = credential.uid !== ''
+  return {
+    ...hasUser ? { 'X-User-Id': credential.uid } : {},
+    ...hasUser && credential.enterpriseId !== undefined && credential.enterpriseId !== ''
+      ? { 'X-Enterprise-Id': credential.enterpriseId, 'X-Tenant-Id': credential.enterpriseId }
+      : {},
+    ...credential.domain === '' ? {} : { 'X-Domain': credential.domain },
+  }
+}
+
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
 function chatHeaders(
   credential: WorkBuddyCredential,
@@ -3186,7 +3234,7 @@ function neutralizeScannedText(text: string): string | undefined {
  * Never throws. A body it cannot read is the upstream's to reject, and a
  * parse error must not turn a retry into a crash.
  */
-export function forceNeutralHead(bodyJson: string): string | undefined {
+function forceHeadInBody(bodyJson: string, mode: 'all' | 'system'): string | undefined {
   let parsed: unknown
   try {
     parsed = JSON.parse(bodyJson)
@@ -3202,6 +3250,13 @@ export function forceNeutralHead(bodyJson: string): string | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
     const message = value as Record<string, unknown>
     if (!scansOpening(message['role'])) continue
+    // ISSUE #297: the `system` head is what the gateway's offset-0 gate wants,
+    // and system is NOT the model's own history — it cannot be imitated into a
+    // future answer. An `assistant` head, by contrast, is copied by the model
+    // into its next reply and persisted (measured with the `Message begins.`
+    // experiment). So the normal rescue moves only system; the blind all-role
+    // head is reserved for the last rung. `mode` decides which roles qualify.
+    if (mode === 'system' && message['role'] !== 'system' && message['role'] !== 'developer') continue
     const content = message['content']
     if (typeof content === 'string') {
       if (content.trim() === '' || startsWithNeutralHead(content)) continue
@@ -3225,6 +3280,35 @@ export function forceNeutralHead(bodyJson: string): string | undefined {
   // Re-serialized from the PARSED object, so the key order of the original
   // body is preserved — the retry is the same request, not a reshuffled one.
   return JSON.stringify(obj)
+}
+
+/**
+ * ISSUE #297 — the FIRST rescue rung: prepend the neutral head to SYSTEM only.
+ *
+ * The gateway's offset-0 gate is a blacklist (measured: Kimi / Cursor / Gemini
+ * openings all answer 200), so system needs only a non-banned opening, and a
+ * system message is not part of the model's own chat history — the model never
+ * imitates it into a future assistant reply. This is enough to rescue the
+ * measured #98 / #189 shapes (system prompt opening refused) WITHOUT planting
+ * the persona line in assistant history, which is what caused #297.
+ *
+ * `undefined` means "nothing changed" — same contract as {@link forceNeutralHead}.
+ */
+export function forceSystemHead(bodyJson: string): string | undefined {
+  return forceHeadInBody(bodyJson, 'system')
+}
+
+/**
+ * The LAST rescue rung: prepend the neutral head to EVERY scanned message,
+ * system and assistant. Kept for the unmeasured case of an assistant opening
+ * that is neither in the prefix blacklist nor covered by the phrase rewrites —
+ * moving it off offset 0 is the only known general rescue. It is deliberately
+ * the LAST rung because it is the one that plants the persona line in assistant
+ * history (issue #297): a model sees its own past answers opening with that
+ * line and copies it into new replies, which the host persists.
+ */
+export function forceNeutralHead(bodyJson: string): string | undefined {
+  return forceHeadInBody(bodyJson, 'all')
 }
 
 /**
@@ -3587,6 +3671,94 @@ export function openingEvidenceOfBody(bodyJson: string): OpeningEvidence[] {
 }
 
 /**
+ * ISSUE #311 — zero-privacy diagnostic for a middle-of-prompt channel gate.
+ *
+ * When the gateway matches a fixed span ANYWHERE inside a large system prompt,
+ * "first line + byte count" tells the reader nothing: a 259k prompt has tens of
+ * thousands of candidate lines and the plugin cannot see which one matched.
+ * This trace reports ONLY COUNTS AND LINE NUMBERS of a small set of identity /
+ * brand words — never a byte of message text — so a user can locate a suspect
+ * line in their OWN transcript (which they already have) and bisect it, and a
+ * maintainer can tell at a glance whether an unrewritten brand sentence is
+ * present on the wire.
+ *
+ * TWO HALVES:
+ *  1. brand/identity word occurrences with line numbers, per scanned message;
+ *  2. a rewrite self-check: how many known `CHANNEL_GATE_PHRASES` `from` strings
+ *     are STILL present in the prepared body (a rewrite that silently missed
+ *     would otherwise be indistinguishable from a new upstream fingerprint).
+ *
+ * No text is ever returned — only the words themselves (a fixed vocabulary),
+ * counts, and line numbers. Safe to paste into a public issue.
+ */
+const TRACE_WORDS: readonly string[] = [
+  'DeepSeek Harness',
+  'codebuddy',
+  'You are',
+  'powered by',
+  'coding agent',
+]
+const TRACE_MAX_LINES_PER_WORD = 6
+
+export interface FingerprintTrace {
+  /** Per scanned message index: word -> 1-based line numbers (capped). */
+  readonly occurrences: ReadonlyMap<number, ReadonlyMap<string, number[]>>
+  /** 1-based indices into CHANNEL_GATE_PHRASES whose `from` is still present. */
+  readonly unrewrittenRows: readonly number[]
+}
+
+export function channelFingerprintTrace(rawJson: string, preparedJson: string): FingerprintTrace {
+  const occurrences = new Map<number, Map<string, number[]>>()
+  const parse = (json: string): unknown => {
+    try { return JSON.parse(json) } catch { return undefined }
+  }
+  const raw = parse(rawJson)
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    const messages = (raw as Record<string, unknown>)['messages']
+    if (Array.isArray(messages)) {
+      for (let index = 0; index < messages.length; index++) {
+        const value = messages[index]
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+        const message = value as Record<string, unknown>
+        const role = typeof message['role'] === 'string' ? message['role'].trim().toLowerCase() : ''
+        if (role !== 'system' && role !== 'assistant' && role !== 'developer') continue
+        const texts: string[] = []
+        if (typeof message['content'] === 'string') texts.push(message['content'])
+        else if (Array.isArray(message['content'])) {
+          for (const part of message['content']) {
+            if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
+            const record = part as Record<string, unknown>
+            if ((record['type'] === 'text' || record['type'] === undefined) && typeof record['text'] === 'string') {
+              texts.push(record['text'])
+            }
+          }
+        }
+        const combined = texts.join('\n')
+        if (combined === '') continue
+        const lines = combined.split('\n')
+        const perWord = new Map<string, number[]>()
+        for (const word of TRACE_WORDS) {
+          const found: number[] = []
+          for (let line = 0; line < lines.length && found.length < TRACE_MAX_LINES_PER_WORD; line++) {
+            if (lines[line]?.toLowerCase().includes(word.toLowerCase())) found.push(line + 1)
+          }
+          if (found.length > 0) perWord.set(word, found)
+        }
+        if (perWord.size > 0) occurrences.set(index, perWord)
+      }
+    }
+  }
+  // Rewrite self-check: does the prepared body still carry any known `from`?
+  const unrewrittenRows: number[] = []
+  if (typeof preparedJson === 'string') {
+    for (let row = 0; row < CHANNEL_GATE_PHRASES.length; row++) {
+      if (preparedJson.includes(CHANNEL_GATE_PHRASES[row]?.[0] ?? '\u0000')) unrewrittenRows.push(row + 1)
+    }
+  }
+  return { occurrences, unrewrittenRows }
+}
+
+/**
  * How many openings the failure path reports.
  *
  * Eight is generous: the gate scans every system message and every text part
@@ -3832,6 +4004,73 @@ function stripLeadingAcpTag(content: unknown): { value: unknown, changed: boolea
   return { value: content, changed: false }
 }
 
+/**
+ * ISSUE #297 — strip the plugin's OWN neutral head from assistant history on
+ * the outbound copy, so a poisoned session stops reinforcing itself.
+ *
+ * When the gateway refuses a body, `neutralizeScannedText` / `forceNeutralHead`
+ * prepend `You are a helpful assistant.\n\n` to EVERY scanned message — including
+ * past assistant turns. The model sees its own whole history opening with that
+ * persona line and starts copying it into NEW answers, which the host persists
+ * as ordinary model output (restart/upgrade cannot clear it). The reporter
+ * proved the mechanism by swapping the line for a meaningless `Message begins.`
+ * and watching the model copy THAT instead: it is shape mimicry, not a write-
+ * back into the transcript.
+ *
+ * SCOPE — deliberately narrow, because this deletes bytes from the wire:
+ *
+ * - ONLY assistant messages. `system` keeps its head (the gateway wants it, and
+ *   it is not the model's own history). `user`/`tool` are never scanned, and
+ *   rewriting a user's words has no upstream basis.
+ * - ONLY the exact injected SHAPE: the head followed by a blank line. A user
+ *   who genuinely asks for an answer starting with that sentence does not add
+ *   the blank line, so their words survive. A bare `Message begins.`-style
+ *   string is NOT in the strip table — the plugin never injected it.
+ * - Up to eight layers, so a model that repeated the head cannot make this an
+ *   unbounded loop. A part stripped to empty keeps its original text: an empty
+ *   assistant text part means nothing on the wire.
+ *
+ * Called AFTER the phrase rewrite (so a newly exposed banned opening can still
+ * be neutralised) and BEFORE `neutralizeChannelFingerprints` (which would
+ * otherwise re-add a head to a just-exposed opening).
+ */
+const INJECTED_HEAD = `${WORKBUDDY_FALLBACK_SYSTEM_PROMPT}\n\n`
+const MAX_INJECTED_HEAD_LAYERS = 8
+
+function stripInjectedAssistantHead(text: string): string {
+  let out = text
+  for (let layer = 0; layer < MAX_INJECTED_HEAD_LAYERS && out.startsWith(INJECTED_HEAD); layer++) {
+    const rest = out.slice(INJECTED_HEAD.length)
+    if (rest.trim() === '') break // never strip a part to empty
+    out = rest
+  }
+  return out
+}
+
+function stripInjectedAssistantHeads(obj: Record<string, unknown>): void {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return
+  for (const value of messages) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const message = value as Record<string, unknown>
+    if (message['role'] !== 'assistant') continue
+    const content = message['content']
+    if (typeof content === 'string') {
+      const next = stripInjectedAssistantHead(content)
+      if (next !== content) message['content'] = next
+      continue
+    }
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
+      const record = part as Record<string, unknown>
+      if (record['type'] !== 'text' || typeof record['text'] !== 'string') continue
+      const next = stripInjectedAssistantHead(record['text'])
+      if (next !== record['text']) record['text'] = next
+    }
+  }
+}
+
 /** Whether this message is one of the harness's injected context blocks. */
 function isInjectedUserMessage(message: Record<string, unknown>, pattern: RegExp): boolean {
   if (message['role'] !== 'user') return false
@@ -3928,6 +4167,11 @@ export function prepareChatBody(source: string, options?: PrepareChatBodyOptions
   // wording, and `neutralizeChannelFingerprints` would insert U+200B inside a
   // phrase first, making the `replaceAll` miss it (issue #163, owner's order).
   rewriteChannelFingerprintPhrasesInBody(obj)
+  // ISSUE #297: strip the neutral heads the plugin itself injected into PAST
+  // assistant turns, so a poisoned session stops teaching the model to open
+  // every answer with that persona line. BETWEEN rewrite and neutralise on
+  // purpose — see `stripInjectedAssistantHeads` for the ordering requirement.
+  stripInjectedAssistantHeads(obj)
   neutralizeChannelFingerprints(obj)
   normalizeToolChoice(obj)
   // AFTER normalizeToolChoice: a `tool_choice: 'none'` body has already had its
@@ -4690,15 +4934,23 @@ interface Envelope {
 }
 
 /**
- * Gateway (openresty/APISIX) rejection of a token it no longer accepts.
+ * Gateway (openresty/APISIX) edge rejection, detected from its HTML error page.
  *
- * The business APIs answer JSON; an edge rejection answers an HTML error page
- * instead. A 401 that is not JSON therefore means the credential was refused
- * before routing — almost always a revoked/expired token rather than a bug in
- * the request. Detected from the body so a proxy's own error page (which would
- * also be HTML) is still described accurately.
+ * The business APIs answer JSON; the gateway answers an HTML error page before
+ * the request is routed. WHAT that rejection means is NOT decidable from the
+ * body alone — issue #305 measured the same APISIX 401 on a chat probe while
+ * the SAME token answered 200 on `/v2/plugin/account` and billing, so the gate
+ * refused that ROUTE, not the token. (An earlier comment here claimed such a
+ * page was "almost always a revoked/expired token"; #305 disproved it.) The
+ * only conclusive revocation signal is a business JSON body carrying
+ * `12153`/`Offline user session not found`, or a 401/403 on the REFRESH hop.
+ *
+ * Kept as a body-shape test so a caller can tell "the gateway refused at the
+ * edge" from "the business API refused the credential" — but callers MUST NOT
+ * turn the former into a permanent credential rejection on body shape alone.
+ * Exported for `outcomeOfFailure` (`src/probe.ts`), which needs the same split.
  */
-function isGatewayAuthRejection(status: number, text: string): boolean {
+export function isGatewayAuthRejection(status: number, text: string): boolean {
   if (status !== 401 && status !== 403) return false
   const lower = text.toLowerCase()
   return lower.includes('openresty') || lower.includes('apisix') || lower.includes('authorization required')
@@ -5613,13 +5865,15 @@ export class WorkBuddyUpstreamClient {
           headers: {
             'Authorization': `Bearer ${credential.accessToken}`,
             'Accept': 'application/json',
-            ...credential.uid === '' ? {} : { 'X-User-Id': credential.uid },
-            ...credential.domain === '' ? {} : { 'X-Domain': credential.domain },
-            // 这一处**刻意不统一**。`/v3/config` 不是"客户端在替用户做事"，而是
-            // 读一份产品配置：它的字节是逐条实测过的（UA 选通道，
-            // 其余头固定），而 P0.5 的收益是在 chat 上量的。给一次元数据读加上
-            // 归属头，只会多几个能被比对的落点，换不来任何东西——与
-            // `fetchModelBusy` 同一条规则。
+            // 账号身份头（不是归属头，见下）：`/v3/config` 按账号作答，少了它
+            // 企业账号会被答成个人名册。见 `catalogIdentityHeaders`。
+            ...catalogIdentityHeaders(credential),
+            // 这一处**刻意不加的是归属头**（`X-Device-Token` 那一类）。`/v3/config`
+            // 不是"客户端在替用户做事"，而是读一份产品配置：它的字节是逐条实测过的
+            // （UA 选通道，其余头固定），而 P0.5 的收益是在 chat 上量的。给一次元数据读
+            // 加上归属头，只会多几个能被比对的落点，换不来任何东西——与
+            // `fetchModelBusy` 同一条规则。账号身份头不在此列：它改变的是**答什么**，
+            // 不是**谁在问**。
             'X-Product': 'SaaS',
             'X-Requested-With': 'XMLHttpRequest',
             'Connection': 'close',
@@ -5688,6 +5942,9 @@ export class WorkBuddyUpstreamClient {
           'Origin': originReferer(credential),
           'Referer': `${originReferer(credential)}/`,
           'User-Agent': PRODUCT_UA,
+          // 企业成员账号不带这套头会被答成个人名册（`cli` 名册缺行）——见
+          // `catalogIdentityHeaders`。回落到旧目录的两次读取同样要带。
+          ...catalogIdentityHeaders(credential),
         },
         signal: timeout,
       })
@@ -5741,8 +5998,10 @@ export class WorkBuddyUpstreamClient {
         method: 'POST',
         headers: {
           // 元数据读，**保持 5.16.0**：`legacyCommonHeaders` 而不是
-          // `commonHeaders`。理由与 `/v3/config` 同一条（见 `:4147` 的注释）——
-          // 这类调用不替用户做事，加身份头只增加落点、不带来收益。
+          // `commonHeaders`。这类调用不替用户做事，加归属头只增加落点、不带来收益。
+          // 与 `/v3/config` 的分别：那边也必须带**账号身份头**（`catalogIdentityHeaders`），
+          // 因为 `/v3/config` 按账号作答、缺了会答成个人名册（#303）；`MODEL_BUSY_PATH`
+          // 回答的是每个模型的忙闲、不按账号裁剪名册，所以没有同一条例外。
           ...legacyCommonHeaders(credential),
           'Authorization': `Bearer ${credential.accessToken}`,
           'Content-Type': 'application/json',
@@ -5805,6 +6064,8 @@ export class WorkBuddyUpstreamClient {
           'Origin': originReferer(credential),
           'Referer': `${originReferer(credential)}/`,
           'User-Agent': mediaChannelUA,
+          // 与 `fetchModels` 同一条理由：目录按账号作答，见 `catalogIdentityHeaders`。
+          ...catalogIdentityHeaders(credential),
         },
         signal: signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS),
       })
