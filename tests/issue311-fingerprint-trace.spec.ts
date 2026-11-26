@@ -100,3 +100,67 @@ describe('issue #311: the trace reaches the refusal text, with no message body',
     expect(text).not.toContain(SECRET)
   })
 })
+
+describe('issue #319: reasoning_content is part of the trace', () => {
+  it('counts brand words in reasoning_content and marks them as such', () => {
+    // The gateway scans the whole request text, and replayed thinking is a
+    // STRING FIELD on the assistant message (not a content part). It used to be
+    // invisible to this trace, so a refusal caused by thinking looked the same
+    // as one caused by nothing.
+    const raw = JSON.stringify({
+      messages: [
+        { role: 'system', content: 'A clean system prompt.' },
+        { role: 'assistant', content: 'A clean answer.', reasoning_content: 'first line\nI am DeepSeek Harness here' },
+      ],
+    })
+    const trace = channelFingerprintTrace(raw, raw)
+    const assistant = trace.occurrences.get(1)
+    expect(assistant, 'the reasoning field must be traced').toBeDefined()
+    // Marked with its field name, so a hit there cannot be read as a content hit.
+    expect(assistant?.get('DeepSeek Harness（reasoning_content）')).toEqual([2])
+    // …and no plain content entry was invented.
+    expect(assistant?.get('DeepSeek Harness')).toBeUndefined()
+    // Still no text anywhere in the structure.
+    expect(JSON.stringify(trace)).not.toContain('I am')
+  })
+})
+
+describe('issue #322: tool_calls arguments are counted too', () => {
+  it('reports brand hits inside tool_calls arguments, marked with the field', () => {
+    // Agentic sessions carry the brand mostly in TOOL PARAMETERS — one reported
+    // sample had 45 hits there and none in content. Counting them is what makes
+    // the trace honest about a body the plugin deliberately does not rewrite:
+    // altering `arguments` would change what the call MEANS (a write call's file
+    // content), so the fix is to report, not to edit.
+    const raw = JSON.stringify({
+      messages: [
+        { role: 'system', content: 'An ordinary prompt.' },
+        {
+          role: 'assistant',
+          content: 'I will read it.',
+          tool_calls: [{
+            id: 'c1',
+            type: 'function',
+            function: { name: 'read', arguments: '{"path":"/work/DeepSeek Harness/src/a.ts"}' },
+          }],
+        },
+      ],
+    })
+    const trace = channelFingerprintTrace(raw, raw)
+    const assistant = trace.occurrences.get(1)
+    expect(assistant?.get('DeepSeek Harness（tool_calls[0].arguments）')).toEqual([1])
+    // No text leaks into the structure — counts and line numbers only.
+    expect(JSON.stringify(trace)).not.toContain('/work/')
+  })
+
+  it('does not flag an ordinary tool call', () => {
+    const raw = JSON.stringify({
+      messages: [{
+        role: 'assistant',
+        content: 'ok',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{"path":"/tmp/a.ts"}' } }],
+      }],
+    })
+    expect(channelFingerprintTrace(raw, raw).occurrences.has(0)).toBe(false)
+  })
+})

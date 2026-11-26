@@ -65,7 +65,7 @@ const DSH_FINGERPRINT = 'You are an AI agent powered by DeepSeek Harness.'
  * before the prefix head would be needed, so the neutral head is NOT prepended
  * for this one anymore.
  */
-const DSH_FINGERPRINT_REWRITTEN = 'You are an AI agent running inside DeepSeek Harness.'
+const DSH_FINGERPRINT_REWRITTEN = 'You are an AI agent running inside the harness.'
 
 /** The other fingerprint in the measured snapshot: Claude Code's own head. */
 const CLAUDE_FINGERPRINT = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -108,6 +108,22 @@ function visible(text: string): string {
   return text.replace(/\u200b/gu, '')
 }
 
+/**
+ * The text with the zero-width breaks removed — and NOTHING else.
+ *
+ * Review caught the first version of this helper stripping the neutral head as
+ * well, on a comment that claimed the replacement wordings had been added to
+ * the prefix list. They deliberately were NOT (see `UNAPPROVED_CHANNEL_OPENINGS`
+ * and the third test in `issue321-rewrite-keeps-break.spec.ts`): a head on
+ * assistant history is the persona line the model imitates, which is #297.
+ * Stripping a head here made six assertions in this file blind to exactly that
+ * regression — injecting the replacement into the prefix list left all 38 cases
+ * green. A helper must not do the assertion's work for it.
+ */
+function bare(text: string): string {
+  return visible(text)
+}
+
 describe('array-shaped system content: every text part is scanned (measured fact 2)', () => {
   it('neutralises a fingerprint in the FIRST part', () => {
     const body = prepared({
@@ -121,7 +137,7 @@ describe('array-shaped system content: every text part is scanned (measured fact
     expect(Array.isArray(content)).toBe(true)
     expect(content).toHaveLength(1)
     expect(content[0]?.type).toBe('text')
-    expect(visible(content[0]?.text ?? '')).toBe(`${DSH_FINGERPRINT_REWRITTEN}\n\nAnd the rest of the prompt.`)
+    expect(bare(content[0]?.text ?? '')).toBe(`${DSH_FINGERPRINT_REWRITTEN}\n\nAnd the rest of the prompt.`)
   })
 
   it('neutralises a fingerprint in the SECOND part too', () => {
@@ -195,7 +211,7 @@ describe('array-shaped system content: every text part is scanned (measured fact
     const content = body.messages[0]?.content as { type: string; text: string }[]
     expect(content[0]?.text).toBe('A perfectly ordinary opening.')
     expect(content[1]?.text).toBeDefined()
-    expect(visible(content[1]?.text ?? '')).toBe(`${DSH_FINGERPRINT_REWRITTEN}\n\nAnd the rest of the prompt.`)
+    expect(bare(content[1]?.text ?? '')).toBe(`${DSH_FINGERPRINT_REWRITTEN}\n\nAnd the rest of the prompt.`)
   })
 
   it('survives a malformed part without throwing', () => {
@@ -220,7 +236,7 @@ describe('string-shaped system content keeps behaving exactly as before', () => 
     const body = prepared({
       messages: [{ role: 'system', content: DSH_FINGERPRINT }, { role: 'user', content: 'hi' }],
     })
-    expect(visible(body.messages[0]?.content as string)).toBe(DSH_FINGERPRINT_REWRITTEN)
+    expect(bare(body.messages[0]?.content as string)).toBe(DSH_FINGERPRINT_REWRITTEN)
     expect(body.messages[1]?.content).toBe('hi')
   })
 
@@ -231,7 +247,7 @@ describe('string-shaped system content keeps behaving exactly as before', () => 
     // position-independent (issue #163).
     const prompt = 'Rules: be nice.\n\nYou are an AI agent powered by DeepSeek Harness.'
     const body = prepared({ messages: [{ role: 'system', content: prompt }] })
-    expect(visible(body.messages[0]?.content as string))
+    expect(bare(body.messages[0]?.content as string))
       .toBe(`Rules: be nice.\n\n${DSH_FINGERPRINT_REWRITTEN}`)
     expect(body.messages[0]?.content as string).not.toContain(WORKBUDDY_FALLBACK_SYSTEM_PROMPT)
   })

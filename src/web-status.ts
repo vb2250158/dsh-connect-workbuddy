@@ -143,6 +143,19 @@ export interface WorkBuddyStatusRouteOptions {
    * with only that option.
    */
   defaultThinkingEfforts?(region: WorkBuddyRegion): Readonly<Record<string, string | undefined>>
+  /**
+   * Credits spent by turns served through this region (issue #320).
+   *
+   * Optional so a Host built before the feature keeps serving: the card then
+   * renders nothing rather than a zero, because "no data" and "cost nothing"
+   * must not look the same.
+   */
+  turnCredits?(region: WorkBuddyRegion): {
+    readonly total: number
+    readonly turns: number
+    readonly unknownTurns: number
+    readonly last?: number
+  } | undefined
   /** Re-read the live catalog of one region from the upstream. */
   discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<WorkBuddyCatalogRead>
   /**
@@ -1556,8 +1569,13 @@ export async function workBuddyWebStatus(
   // matter how often the card or pill polls it. Absent for a Host that predates
   // the feature, which renders no segment at all.
   const rosterSeen = deps.rosterSeen === undefined ? undefined : await deps.rosterSeen(region)
+  // ISSUE #320: what this region's turns have cost so far. Read per call so the
+  // card reflects the turn the user just ran, and omitted entirely for a Host
+  // that predates the feature — a zero would read as "this cost nothing".
+  const turnCredits = deps.turnCredits?.(region)
   return {
     status: 'signed-in',
+    ...turnCredits === undefined ? {} : { turnCredits },
     // The persisted per-region budgets, read straight from the Host config.
     // The browser settings mirror can be stale — a write made through the Host
     // save endpoint never updates it — so the card renders these instead of
@@ -1888,7 +1906,38 @@ export function registerWorkBuddyStatusRoute(ctx: Context, deps: WorkBuddyStatus
      */
     const disposers: (() => void)[] = []
     const route = (entry: Parameters<typeof ctx.webServer.register>[0]): void => {
-      disposers.push(ctx.webServer.register(entry))
+      // ISSUE #323 — EACH ROUTE IS ITS OWN EFFECT, not a bare disposer collected
+      // in an array.
+      //
+      // The array alone (issue #86's fix) stopped "a new route forgot its
+      // disposer", but not a throw MIDWAY: the body registers 16 routes and only
+      // returns the disposer on its LAST line, so if route k throws — a duplicate
+      // path during hot reload is the reported case — the body never reaches the
+      // `return`, no cleanup function is produced, the array is lost with the
+      // frame, and routes 1..k-1 keep answering from an unloaded instance.
+      //
+      // HOW THE ROLLBACK ACTUALLY HAPPENS (corrected after review measured it —
+      // the first version of this comment was wrong). `ctx.effect` registers each
+      // wrapper on the FIBER's disposable list (`fiber._disposables`), NOT on the
+      // outer effect's local array; that array is only filled from the body's
+      // RETURN VALUE. So when the body throws, nothing is disposed at that
+      // instant — the earlier routes stay mounted until the fiber itself unloads,
+      // and the unload is what clears them (`_reload` catches, `_unload`,
+      // `clearing()`).
+      //
+      // THE PRECONDITION THAT MAKES THIS WORK: the exception must reach `apply`.
+      // Do NOT wrap this registration in a `try/catch` to "keep the plugin
+      // loading despite a duplicate path" — if the fiber does not unload, the
+      // first k-1 routes stay mounted for ever and #323 is exactly what returns.
+      // If that robustness is ever wanted, do it HERE and explicitly dispose on
+      // the way out (`try { … } catch (error) { for (const d of disposers) d();
+      // throw error }`), which is behaviour this comment previously claimed to
+      // have already.
+      //
+      // The returned disposer is idempotent (Cordis guards with `disposing` and
+      // `runner.epoch`), so the trailing loop below is still correct and merely
+      // redundant — it is kept because it is what a reader expects to see.
+      disposers.push(ctx.effect(() => ctx.webServer.register(entry)))
     }
 
     /**

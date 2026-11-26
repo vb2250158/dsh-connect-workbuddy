@@ -26,9 +26,10 @@ import { preferredAccountName, workbuddyAccountId } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import type { WorkBuddyRefusalReport } from './off-thinking.ts'
 import { usageOfChunk } from './body-report.ts'
+import type { WorkBuddyUsageCounts } from './body-report.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { DsmlStreamBuffer } from './dsml-recovery.ts'
-import type { RecoveredToolCall, RecoveryGate } from './dsml-recovery.ts'
+import type { BufferOutcome, RecoveredToolCall, RecoveryGate } from './dsml-recovery.ts'
 import { parseQueueAnswer, queueNoticeText } from './queue.ts'
 import {
   declaredTools,
@@ -54,6 +55,8 @@ import {
   WorkBuddyUpstreamClient,
   type UpstreamErrorKind,
   type WorkBuddyChatResult,
+  /* Issue #316: one line describing WHICH credential a refused request used. */
+  describeProvenance as describeCredential,
 } from './upstream.ts'
 
 /** Minimal logger surface the plugin context already provides. */
@@ -266,11 +269,7 @@ export interface WorkBuddyShimOptions {
    *
    * Fired without awaiting, and never allowed to fail the request.
    */
-  onUpstreamUsage?: (usage: {
-    promptTokens?: number
-    completionTokens?: number
-    cachedTokens?: number
-  }) => void
+  onUpstreamUsage?: (usage: WorkBuddyUsageCounts) => void
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -316,6 +315,11 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   model_queue: 429,
   not_found: 502,
   server: 502,
+  // 401, because that IS what the gateway answered (issue #316). Kept separate
+  // from `session_dead`, which also surfaces as 401: the status is a fact about
+  // the wire, the KIND is what the plugin believes, and `isFailoverWorthy`
+  // decides what happens next.
+  gateway_auth: 401,
   client: 400,
 }
 
@@ -592,6 +596,20 @@ class RecoveryStream {
    * client two answers to the same question.
    */
   private nativeCallsSeen = false
+  /**
+   * The last chunk/choice this stream saw, kept so a call recovered at FLUSH
+   * time can still be framed.
+   *
+   * ISSUE #298 follow-up: a bare block has no marker, so it can only be
+   * recognised once the whole thing has arrived — `flush()` is the only place
+   * that produces these calls. The first version of that feature returned them
+   * from `flush()` without teaching the two flush CONSUMERS to read them, so the
+   * call was dropped while its bytes were stripped: the user got a truncated or
+   * empty answer, with no notice and no retry. Keeping the frame template is
+   * what lets the flush path emit the same `tool_calls` frame `add()` does.
+   */
+  private lastChunk: Record<string, unknown> | undefined
+  private lastChoice: Record<string, unknown> | undefined
 
   private readonly buffer: DsmlStreamBuffer | undefined
 
@@ -613,12 +631,15 @@ class RecoveryStream {
     gate: RecoveryGate | undefined,
     private readonly logger: ShimLogger | undefined,
     notice?: string,
-    /** Called once, with the upstream's token counts, when the stream reports them. */
-    private readonly onUsage?: (usage: {
-      promptTokens?: number
-      completionTokens?: number
-      cachedTokens?: number
-    }) => void,
+    /**
+     * Called once, with the upstream's token counts AND the credits this turn
+     * was billed (issue #320), when the stream reports them.
+     *
+     * The type is the shared {@link WorkBuddyUsageCounts} rather than an inline
+     * copy: the copy used to omit `credit`, which is how the field could exist
+     * on the wire and be unreadable to every consumer at once.
+     */
+    private readonly onUsage?: (usage: WorkBuddyUsageCounts) => void,
   ) {
     this.buffer = gate === undefined ? undefined : new DsmlStreamBuffer(gate)
     this.notice = notice
@@ -742,9 +763,14 @@ class RecoveryStream {
    */
   finish(): void {
     const flushed = this.buffer?.flush()
-    if (flushed !== undefined && flushed.text !== '') {
-      this.noteResidue(!flushed.prose)
-      this.emitContent(flushed.text)
+    if (flushed !== undefined) {
+      // Same rule as `drainBuffer`: a bare block is only ever resolved here, so
+      // its call must be sent before the text it was stripped out of.
+      this.emitFlushedCalls(flushed)
+      if (flushed.text !== '') {
+        this.noteResidue(!flushed.prose)
+        this.emitContent(flushed.text)
+      }
     }
     this.closeWindow()
     if (!this.sawDone && this.res.writable) this.emitFrame('data: [DONE]\n\n')
@@ -905,6 +931,10 @@ class RecoveryStream {
     // the answer is proven real, frames are queued rather than forwarded.
     this.windowOpened = true
 
+    // Remember the frame template: a bare block is only resolved at flush time,
+    // and the flush consumers need something to build a `tool_calls` frame from.
+    this.lastChunk = chunk
+    this.lastChoice = choiceRecord
     const outcome = this.buffer.add(content)
     if (outcome.calls !== undefined && outcome.calls.length > 0) {
       // Queued through `send` first so it lands ahead of any `finish_reason`
@@ -945,9 +975,39 @@ class RecoveryStream {
    */
   private drainBuffer(): void {
     const flushed = this.buffer?.flush()
-    if (flushed === undefined || flushed.text === '') return
+    if (flushed === undefined) return
+    // A bare block is resolved EXACTLY HERE (issue #298): it has no marker, so
+    // it cannot be recognised until the whole thing has arrived. Emitting the
+    // call is not optional — `flush()` already swallowed the block's bytes, so
+    // a dropped call means the user sees a truncated answer with no tool
+    // execution, no notice and no retry. The call goes first, mirroring `add()`.
+    this.emitFlushedCalls(flushed)
+    if (flushed.text === '') return
     this.noteResidue(!flushed.prose)
     this.emitContent(flushed.text)
+  }
+
+  /**
+   * Emit calls that `flush()` recovered, if any.
+   *
+   * Shares `callsFrame` with the `add()` path so a flushed call is byte-shaped
+   * like any other; only the framing template differs (the last frame seen).
+   */
+  private emitFlushedCalls(flushed: BufferOutcome): void {
+    if (flushed.calls === undefined || flushed.calls.length === 0) return
+    const chunk = this.lastChunk
+    const choice = this.lastChoice
+    if (chunk === undefined || choice === undefined) {
+      // No frame was ever seen, so there is nothing to build a delta from. That
+      // cannot happen for a bare block (it needs content to exist at all), and
+      // inventing a frame here would be worse than reporting nothing.
+      this.logger?.warn('dsh-connect-workbuddy: recovered a call with no frame template to send it in')
+      return
+    }
+    this.flushNotice()
+    this.send(callsFrame(chunk, choice, flushed.calls), false)
+    this.wroteContent = true
+    this.closeWindow()
   }
 
   /**
@@ -1175,6 +1235,13 @@ function failoverReasonText(failure: WorkBuddyChatResult): string {
     // is at fault. Neither is — the same body will be refused by every account.
     case 'client':
       return '请求被上游拒绝'
+    // A 401/403 from the GATEWAY EDGE (issue #316). The wording avoids every
+    // cause the plugin cannot see: it is neither "your parameters are wrong"
+    // (which is what `client` said, and a reporter measured that to be false —
+    // the same token worked directly) nor "your sign-in died" (#305 disproved
+    // that from an HTML page alone).
+    case 'gateway_auth':
+      return '被网关在边缘拒绝（无法归因到账号或参数）'
     default:
       // No status code here. The caller already renders `（http N）` for every
       // failure, so embedding it again produced "（http 400）（http 400）" — the
@@ -1726,8 +1793,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // Before it was its own kind a queue fell through to `server`/`soft_rate`
     // (the status it rides on), both of which fail over — so one queued request
     // walked the whole pool before the user was told their position.
+    //
+    // `gateway_auth` joins them too, on MEASURED evidence (issue #316): the
+    // reporter probed 3 hosts × 2 accounts and all SIX answered 200 + SSE with
+    // the credentials the plugin was refusing, so the edge refusal is not
+    // account-scoped. Rotating would spend one real request per account to
+    // learn nothing — the same waste `channel_reject` was excluded for — and it
+    // would record a failure against a credential that was never at fault.
     return kind !== 'client' && kind !== 'model_busy' && kind !== 'channel_reject'
-      && kind !== 'model_queue'
+      && kind !== 'model_queue' && kind !== 'gateway_auth'
   }
 
   async function chatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -2396,7 +2470,19 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           ? '按上面列出的写法检查工具定义；换模型只是绕开，不会修好它'
           : result.kind === 'client'
             ? '该请求被上游按参数拒绝：与网络、账号、额度都无关，换账号也不会改变结果，请按上面的提示调整后重试'
-            : shortfall === undefined
+            : result.kind === 'gateway_auth'
+              // NOT "参数问题" (a reporter measured the same token answering 200
+              // directly, so parameters were not at fault) and NOT "登录失效"
+              // (#305 disproved that from an HTML page). What is true: the edge
+              // refused, the plugin cannot attribute it, and here is WHICH
+              // credential was sent — the one fact that localises it (issue #316).
+              ? (result.provenance === undefined
+                // Without provenance there is no 「凭据来源」 line to point at, and
+                // telling the reader to include it would send them looking for
+                // text that does not exist (caught by this file's own test).
+                ? '这是一次边缘拒绝，插件无法据此判定账号或参数有问题'
+                : '这是一次边缘拒绝，插件无法据此判定账号或参数有问题；请把上面「凭据来源」那行连同本段一起反馈')
+              : shortfall === undefined
               ? ''
               : '建议换一个模型继续，或稍后等待该账号的额度恢复'
       // `displayTips` and most `msg` bodies already end in a full stop, so gluing
@@ -2433,11 +2519,19 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           ? `${BODY_OVERSIZE_MARKER}。`
           : ''
       const body = `${overflow}${advice === '' ? receipt : `${receipt.replace(/[。.]$/u, '')}。${advice}`}`
+      // ISSUE #316: which credential this request used. Only for kinds where the
+      // question "was it this file or another copy of the same account" is live —
+      // a `gateway_auth` edge refusal, and a credential rejection. Adding it to
+      // every failure would bury the sentence that actually matters.
+      const provenance = (result.kind === 'gateway_auth' || result.kind === 'session_dead')
+        && result.provenance !== undefined
+        ? ` 凭据来源：${describeCredential(result.provenance)}。`
+        : ''
       writeOpenAIError(
         res,
         KIND_STATUS[result.kind],
         result.kind,
-        `workbuddy 上游失败：${failoverReasonText(result)}（http ${result.status}）${note}${why}${stamp}。${body}`,
+        `workbuddy 上游失败：${failoverReasonText(result)}（http ${result.status}）${note}${why}${stamp}。${body}${provenance}`,
         hostErrorCode(result.kind),
       )
       return
@@ -2465,6 +2559,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       // (`pwdsh` for `pwsh`) is read as that tool instead of falling back to
       // plain text. Same rule as above — only ever a name already on offer.
       repairNearMissName: true,
+      // Issue #298: recover a call written with NO marker at all. The trigger is
+      // the protocol's own vocabulary (`tool_call` / `arg_key` / `arg_value` /
+      // `parameter`), never a tool or parameter name alone — `<bash>ls</bash>`
+      // in a user's sentence must never become a call. See `PROTOCOL_VOCABULARY`.
+      bareMarkup: true,
       ...declared.pinnedToolName === undefined ? {} : { pinnedToolName: declared.pinnedToolName },
     }
 

@@ -165,6 +165,30 @@ export type UpstreamErrorKind =
   | 'model_queue'
   | 'not_found'
   | 'server'
+  /**
+   * A 401/403 that came from the GATEWAY EDGE rather than the business API
+   * (issue #316).
+   *
+   * WHY IT IS NOT `client`. `client` is documented as "the upstream refused the
+   * request's PARAMETERS: retrying cannot help, and the account is not at
+   * fault". A gateway HTML page says no such thing — it is produced before the
+   * request reaches the business layer, so it cannot be evidence about a
+   * parameter. A reporter measured exactly that mismatch: an APISIX
+   * `401 Authorization Required` page was rendered as 「该请求被上游按参数拒绝…
+   * 与网络、账号、额度都无关」 while the same token answered 200 + SSE when used
+   * directly, on all six host×account combinations he tried.
+   *
+   * WHY IT IS NOT `session_dead` EITHER. Issue #305 disproved the opposite
+   * error: a gateway 401 page is NOT proof the credential was revoked. The only
+   * conclusive revocation signals are a business JSON body carrying
+   * `12153` / `Offline user session not found`, or a 401/403 on the REFRESH hop.
+   *
+   * So this kind states the one thing that IS known — the refusal happened at
+   * the edge, where the plugin cannot attribute it — and it exists so the error
+   * can carry the credential provenance (#316) instead of guessing a cause.
+   */
+  | 'gateway_auth'
+  | 'server'
   | 'client'
 
 /** Reasoning capability as the upstream catalog declares it. */
@@ -447,6 +471,17 @@ export type WorkBuddyChatResult =
       message: string
       /** Structured fields lifted from a JSON failure body, when there were any. */
       detail?: UpstreamErrorDetail | undefined
+      /**
+       * Which credential this failed request used (issue #316).
+       *
+       * On the RESULT rather than only on an Error class, because this is how a
+       * failure actually reaches the user: `chatStream` returns a result object
+       * and the shim renders `message` into the reply. The first attempt at
+       * #316 attached provenance to `WorkBuddyCredentialRejectedError` only,
+       * and a gateway 401 — which becomes `gateway_auth`, never that class —
+       * came out with no provenance at all. The reporter measured it.
+       */
+      provenance?: WorkBuddyCredentialProvenance | undefined
     }
 
 /**
@@ -1616,6 +1651,11 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   if (parseQueueAnswer(body) !== undefined) return 'model_queue'
   if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
+  // BEFORE the generic 4xx branch (issue #316): a gateway HTML page must not be
+  // reported as "your request parameters are wrong". `isGatewayAuthRejection`
+  // is already the shared body-shape test for "refused at the edge", so the
+  // classification and that predicate cannot drift apart.
+  if (isGatewayAuthRejection(status, body)) return 'gateway_auth'
   if (status >= 500) return 'server'
   if (status >= 400) return 'client'
   return 'client'
@@ -2713,6 +2753,38 @@ export const WORKBUDDY_FALLBACK_SYSTEM_PROMPT = 'You are a helpful assistant.'
 const UNAPPROVED_CHANNEL_OPENINGS: readonly string[] = [
   'you are an ai agent powered by deepseek harness',
   "you are claude code, anthropic's official cli for claude",
+  // THE PLUGIN'S OWN REPLACEMENT WORDINGS ARE DELIBERATELY NOT LISTED HERE
+  // (issue #321 considered it and it is the wrong lever).
+  //
+  // This list means "this opening IS refused at offset 0", and the remedy it
+  // triggers is a neutral HEAD. Adding the replacement would declare the
+  // plugin's own output banned, which is circular: the rewrite exists to produce
+  // a sentence the gateway accepts, so re-marking it as refused can only be
+  // self-fulfilling. And the practical cost is known — a head on an ASSISTANT
+  // message is exactly the persona line the model copies into its next reply
+  // and the host persists (issue #297, measured with the `Message begins.`
+  // experiment).
+  //
+  // The protection the replacement actually needs is the ANYWHERE substring
+  // gate, and that is {@link IDENTITY_CLAUSE}'s job: it breaks the clause
+  // internally with zero-width characters, without adding a line the model can
+  // imitate. So the replacement wordings are clause-matched (see below) and NOT
+  // prefix-listed, which is why a rewritten assistant turn stays clean.
+  //
+  // HOW MUCH THIS IS WORTH DEPENDS ON THE GATEWAY, and the two measurements in
+  // this file must not be read as contradicting each other:
+  //
+  //   - on the CN gateway, two probes measured that invisible characters are
+  //     NORMALISED away before matching (2026-10-29, see the note above
+  //     `breakIdentityClauses`) — there this break adds nothing, and the phrase
+  //     REWRITE is the only path to a 200. That is why #319 removed the brand
+  //     from these very `to` values: making the sentence acceptable at the
+  //     source is what works on that gateway.
+  //   - on a gateway that matches the raw bytes (the workbuddy2api-hub #533
+  //     bisection), the break does defeat the substring match.
+  //
+  // So this layer is a second line for the byte-matching case, not a substitute
+  // for the rewrite. Do not delete the rewrite on the strength of it.
 ]
 
 /**
@@ -2748,7 +2820,7 @@ const UNAPPROVED_CHANNEL_OPENINGS: readonly string[] = [
  * to the break rule itself.
  */
 const IDENTITY_CLAUSE =
-  /(you)(\s+are\s+(?:(?:an?\s+)?[\w-]*\s*agent\s+powered\s+by|interacting\s+with\s+the\s+user\s+through\s+the\s+deepseek\s+harness))/giu
+  /(you)(\s+are\s+(?:(?:an?\s+)?[\w-]*\s*agent\s+(?:powered\s+by|running\s+on\s+the|running\s+inside\s+the\s+harness(?=\s*(?:[.。!?]|$)))|(?:interacting\s+with\s+the\s+user\s+through\s+the\s+deepseek\s+harness|working\s+with\s+the\s+user\s+inside\s+the\s+harness\s+web\s+gui)))/giu
 
 /**
  * Break an identity clause at EVERY word boundary inside it.
@@ -2847,6 +2919,28 @@ function scansOpening(role: unknown): boolean {
 }
 
 /**
+ * Whether a content part is TEXT — the ONE definition every pass shares.
+ *
+ * ISSUE #315 + review: several passes read a part's `type` and each carried its
+ * own copy of the test, and they drifted. Worse, the first fix updated some of
+ * them and left others on the old STRICT rule, which kept the #297 re-poisoning
+ * channel open: an assistant part shaped `{ text: '…' }` with no `type` kept the
+ * injected persona head, the model imitates it on the next turn, and the host
+ * writes it into the session file — so a rescue poisoned the history it was
+ * meant to repair.
+ *
+ * A part that carries `text` and no `type` has exactly one sensible reading,
+ * and the alternative is leaving it unprotected on the wire. An EXPLICIT other
+ * type (an image part, say) is still skipped: the `text` check alone would not
+ * be enough there, so both conditions are kept.
+ */
+function isTextPart(record: Record<string, unknown>): boolean {
+  const type = record['type']
+  if (type !== undefined && (typeof type !== 'string' || type.trim().toLowerCase() !== 'text')) return false
+  return typeof record['text'] === 'string'
+}
+
+/**
  * The gateway's current content fingerprints, and same-meaning rewrites for
  * them (issue #163).
  *
@@ -2882,9 +2976,22 @@ function scansOpening(role: unknown): boolean {
  * `tests/issue163-sentence-rewrite.spec.ts`.
  */
 const CHANNEL_GATE_PHRASES: readonly (readonly [string, string])[] = [
+  // ISSUE #319: the `to` strings below carry NO brand name. Two rows used to
+  // keep it ("running inside DeepSeek Harness", "working with the user inside
+  // the DeepSeek Harness Web GUI"), and a real 5.31.8 sample proved that
+  // mattered: after rewriting, a 10,761-char system still carried two
+  // `DeepSeek Harness` tokens — exactly these two rows — and the gateway
+  // refused the body anyway while the trace reported "all known fingerprints
+  // cleared". A rewrite that leaves the fingerprint's distinctive token on the
+  // wire is a rewrite of the verb, not of the fingerprint, and neither
+  // `IDENTITY_CLAUSE` nor the prefix list covers the REPLACED wording.
+  //
+  // The brand is not load-bearing here: these sentences tell the model which
+  // interface it is in and that a checkout exists — "the harness" carries the
+  // same meaning without naming the product.
   [
     'You are an AI agent powered by DeepSeek Harness',
-    'You are an AI agent running inside DeepSeek Harness',
+    'You are an AI agent running inside the harness',
   ],
   [
     'You are a coding agent powered by the ',
@@ -2892,7 +2999,7 @@ const CHANNEL_GATE_PHRASES: readonly (readonly [string, string])[] = [
   ],
   [
     'You are interacting with the user through the DeepSeek Harness Web GUI',
-    'You are working with the user inside the DeepSeek Harness Web GUI',
+    'You are working with the user inside the harness Web GUI',
   ],
   // Reported by liyixin21 and found in appulsexi-maker's real system prompt
   // (issue #163, 19:12). Same-meaning rewrite; the table is meant to grow.
@@ -3100,10 +3207,21 @@ function rewriteChannelFingerprintPhrasesInBody(obj: Record<string, unknown>): v
     for (const part of content) {
       if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
       const record = part as Record<string, unknown>
-      const type = record['type']
-      if (typeof type !== 'string' || type.trim().toLowerCase() !== 'text') continue
-      const text = record['text']
-      if (typeof text !== 'string') continue
+      // ISSUE #315 — a text part with NO `type` is still text.
+      //
+      // Three passes read this same field (rewrite, strip, neutralise) and they
+      // used to disagree: all three required `type === 'text'`, while the
+      // fingerprint TRACE accepted `type === undefined` as well. So a part
+      // shaped `{ text: "…" }` escaped the rewrite AND neutralisation while
+      // still being counted by the trace — the self-check then reported
+      // "known fingerprints remain in the body", which is literally true and
+      // looked like a broken rewrite table.
+      //
+      // Accepting the unspecified type everywhere is the safe direction: a part
+      // that carries `text` and no `type` has exactly one sensible reading, and
+      // the alternative leaves it unprotected on the wire.
+      if (!isTextPart(record)) continue
+      const text = record['text'] as string
       const next = rewriteChannelFingerprintPhrases(text)
       if (next !== text) record['text'] = next
     }
@@ -3152,10 +3270,21 @@ function neutralizeChannelFingerprints(obj: Record<string, unknown>): void {
       // about to go on the wire, and a throw here would cost the whole request.
       if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
       const record = part as Record<string, unknown>
-      const type = record['type']
-      if (typeof type !== 'string' || type.trim().toLowerCase() !== 'text') continue
-      const text = record['text']
-      if (typeof text !== 'string') continue
+      // ISSUE #315 — a text part with NO `type` is still text.
+      //
+      // Three passes read this same field (rewrite, strip, neutralise) and they
+      // used to disagree: all three required `type === 'text'`, while the
+      // fingerprint TRACE accepted `type === undefined` as well. So a part
+      // shaped `{ text: "…" }` escaped the rewrite AND neutralisation while
+      // still being counted by the trace — the self-check then reported
+      // "known fingerprints remain in the body", which is literally true and
+      // looked like a broken rewrite table.
+      //
+      // Accepting the unspecified type everywhere is the safe direction: a part
+      // that carries `text` and no `type` has exactly one sensible reading, and
+      // the alternative leaves it unprotected on the wire.
+      if (!isTextPart(record)) continue
+      const text = record['text'] as string
       const next = neutralizeScannedText(text)
       if (next !== undefined) record['text'] = next
     }
@@ -3268,10 +3397,12 @@ function forceHeadInBody(bodyJson: string, mode: 'all' | 'system'): string | und
     for (const part of content) {
       if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
       const record = part as Record<string, unknown>
-      const type = record['type']
-      if (typeof type !== 'string' || type.trim().toLowerCase() !== 'text') continue
-      const text = record['text']
-      if (typeof text !== 'string' || text.trim() === '' || startsWithNeutralHead(text)) continue
+      // Same predicate as every other pass. A typeless text part is still text,
+      // and this is the RESCUE path: skipping it would leave exactly the part
+      // that escaped the rewrite without the head this rung exists to add.
+      if (!isTextPart(record)) continue
+      const text = record['text'] as string
+      if (text.trim() === '' || startsWithNeutralHead(text)) continue
       record['text'] = `${WORKBUDDY_FALLBACK_SYSTEM_PROMPT}\n\n${text}`
       changed = true
     }
@@ -3542,10 +3673,21 @@ export function perturbChannelFingerprints(
     for (const part of content) {
       if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
       const record = part as Record<string, unknown>
-      const type = record['type']
-      if (typeof type !== 'string' || type.trim().toLowerCase() !== 'text') continue
-      const text = record['text']
-      if (typeof text !== 'string') continue
+      // ISSUE #315 — a text part with NO `type` is still text.
+      //
+      // Three passes read this same field (rewrite, strip, neutralise) and they
+      // used to disagree: all three required `type === 'text'`, while the
+      // fingerprint TRACE accepted `type === undefined` as well. So a part
+      // shaped `{ text: "…" }` escaped the rewrite AND neutralisation while
+      // still being counted by the trace — the self-check then reported
+      // "known fingerprints remain in the body", which is literally true and
+      // looked like a broken rewrite table.
+      //
+      // Accepting the unspecified type everywhere is the safe direction: a part
+      // that carries `text` and no `type` has exactly one sensible reading, and
+      // the alternative leaves it unprotected on the wire.
+      if (!isTextPart(record)) continue
+      const text = record['text'] as string
       const next = perturb(text)
       if (next !== undefined) {
         record['text'] = next
@@ -3646,8 +3788,7 @@ export function openingEvidenceOfBody(bodyJson: string): OpeningEvidence[] {
       for (const part of content) {
         if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
         const record = part as Record<string, unknown>
-        const type = record['type']
-        if (typeof type !== 'string' || type.trim().toLowerCase() !== 'text') continue
+        if (!isTextPart(record)) continue
         const text = record['text']
         if (typeof text === 'string') texts.push(text)
       }
@@ -3728,14 +3869,13 @@ export function channelFingerprintTrace(rawJson: string, preparedJson: string): 
           for (const part of message['content']) {
             if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
             const record = part as Record<string, unknown>
-            if ((record['type'] === 'text' || record['type'] === undefined) && typeof record['text'] === 'string') {
-              texts.push(record['text'])
+            if (isTextPart(record)) {
+              texts.push(record['text'] as string)
             }
           }
         }
         const combined = texts.join('\n')
-        if (combined === '') continue
-        const lines = combined.split('\n')
+        const lines = combined === '' ? [] : combined.split('\n')
         const perWord = new Map<string, number[]>()
         for (const word of TRACE_WORDS) {
           const found: number[] = []
@@ -3743,6 +3883,57 @@ export function channelFingerprintTrace(rawJson: string, preparedJson: string): 
             if (lines[line]?.toLowerCase().includes(word.toLowerCase())) found.push(line + 1)
           }
           if (found.length > 0) perWord.set(word, found)
+        }
+        // ISSUE #319: `reasoning_content` is scanned by the gateway but was
+        // invisible to this trace, so a refusal caused entirely by replayed
+        // thinking looked identical to one caused by nothing at all. Counted
+        // the same way — occurrence counts and line numbers, never text — with
+        // its own pseudo-line so a hit there cannot be mistaken for a content
+        // hit. The key is read directly because it is a STRING FIELD on the
+        // assistant message, not a content part (see `body-report.ts`).
+        // ISSUE #322: `tool_calls[].function.arguments` is a MAJOR carrier in
+        // agentic sessions — 45 hits in one reported sample, all of them
+        // workspace paths containing the brand — and it was invisible here.
+        //
+        // COUNTED, NOT REWRITTEN, and that distinction is deliberate. Rewriting
+        // this field changes what a tool call MEANS: a `write` call's file
+        // content would be silently altered, which is far worse than a refusal
+        // (see docs/WB400-FIX-PLUGIN-RESEARCH.md §3.1, where a competing plugin
+        // does exactly that and is rejected for it). So the trace reports the
+        // fact and leaves the bytes alone — the reader then decides whether to
+        // edit the session, which is a decision only they can make.
+        const toolCalls = message['tool_calls']
+        if (Array.isArray(toolCalls)) {
+          toolCalls.forEach((call, callIndex) => {
+            if (typeof call !== 'object' || call === null || Array.isArray(call)) return
+            const fn = (call as Record<string, unknown>)['function']
+            if (typeof fn !== 'object' || fn === null || Array.isArray(fn)) return
+            const args = (fn as Record<string, unknown>)['arguments']
+            if (typeof args !== 'string' || args === '') return
+            const argLines = args.split('\n')
+            for (const word of TRACE_WORDS) {
+              const found: number[] = []
+              for (let line = 0; line < argLines.length && found.length < TRACE_MAX_LINES_PER_WORD; line++) {
+                if (argLines[line]?.toLowerCase().includes(word.toLowerCase())) found.push(line + 1)
+              }
+              if (found.length === 0) continue
+              perWord.set(`${word}（tool_calls[${callIndex}].arguments）`, found)
+            }
+          })
+        }
+        for (const field of ['reasoning_content', 'reasoning', 'reasoning_text'] as const) {
+          const value = message[field]
+          if (typeof value !== 'string' || value === '') continue
+          const reasoningLines = value.split('\n')
+          for (const word of TRACE_WORDS) {
+            const found: number[] = []
+            for (let line = 0; line < reasoningLines.length && found.length < TRACE_MAX_LINES_PER_WORD; line++) {
+              if (reasoningLines[line]?.toLowerCase().includes(word.toLowerCase())) found.push(line + 1)
+            }
+            if (found.length === 0) continue
+            const key = `${word}（${field}）`
+            perWord.set(key, found)
+          }
         }
         if (perWord.size > 0) occurrences.set(index, perWord)
       }
@@ -3996,9 +4187,10 @@ function stripLeadingAcpTag(content: unknown): { value: unknown, changed: boolea
   for (const part of content) {
     if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
     const record = part as Record<string, unknown>
-    if (record['type'] !== 'text' || typeof record['text'] !== 'string') continue
-    if (!ACP_LEADING_TAG.test(record['text'])) continue
-    record['text'] = record['text'].replace(ACP_LEADING_TAG, '')
+    if (!isTextPart(record)) continue
+    const partText = record['text'] as string
+    if (!ACP_LEADING_TAG.test(partText)) continue
+    record['text'] = partText.replace(ACP_LEADING_TAG, '')
     return { value: content, changed: true }
   }
   return { value: content, changed: false }
@@ -4064,9 +4256,10 @@ function stripInjectedAssistantHeads(obj: Record<string, unknown>): void {
     for (const part of content) {
       if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
       const record = part as Record<string, unknown>
-      if (record['type'] !== 'text' || typeof record['text'] !== 'string') continue
-      const next = stripInjectedAssistantHead(record['text'])
-      if (next !== record['text']) record['text'] = next
+      if (!isTextPart(record)) continue
+      const headText = record['text'] as string
+      const next = stripInjectedAssistantHead(headText)
+      if (next !== headText) record['text'] = next
     }
   }
 }
@@ -4975,17 +5168,90 @@ export class WorkBuddyCredentialRejectedError extends Error {
   readonly code = CREDENTIAL_REJECTED_CODE
   /** HTTP status the upstream answered with (401 or 403). */
   readonly status: number
+  /**
+   * Where the credential that got refused came from (issue #316).
+   *
+   * Deliberately NOT the token. A reporter spent a long session unable to
+   * answer "which of my six auth files did this request use", because the error
+   * said only that a token was rejected; the same account can have several auth
+   * files on disk with different `domain`/`expiresAtMs`, and the one the plugin
+   * picked may not be the one the user was looking at. These four fields are
+   * what tell those files apart.
+   */
+  readonly provenance: WorkBuddyCredentialProvenance | undefined
 
-  constructor(status: number) {
+  constructor(status: number, provenance?: WorkBuddyCredentialProvenance) {
+    // THE CAUSE IS NOT WRITTEN IN ANY MORE. The old text asserted "most likely
+    // a stale credential file", and issue #316 measured a case where that was
+    // false: the token worked when used directly, and the refusal tracked a
+    // DESKTOP-SIDE sign-in switch. Telling a user to sign in again when the
+    // sign-in is fine points them at a fix that cannot work — the same mistake
+    // `account-pool-run.ts` records for `credential-rejected`. What is known is
+    // the status and where the credential came from; the advice is offered as
+    // one possibility among others.
     super(
       `workbuddy: the signed-in credential was rejected by the upstream gateway (http ${status}).`
-      + ' The stored token is no longer accepted — most likely a stale credential file from an earlier'
-      + ' sign-in was selected. Re-sign in to the WorkBuddy desktop app, then pick that account in the'
-      + ' plugin card. Run `dsh-connect-workbuddy doctor` to list every discovered credential.',
+      + (provenance === undefined ? '' : ` Credential used: ${describeProvenance(provenance)}.`)
+      + ' Causes include an expired or revoked sign-in, and a credential file that is no longer the'
+      + ' one the desktop app is using. Re-sign in to the WorkBuddy desktop app, then pick that'
+      + ' account in the plugin card; `dsh-connect-workbuddy doctor` lists every discovered'
+      + ' credential together with its file, domain and expiry.',
     )
     this.name = 'WorkBuddyCredentialRejectedError'
     this.status = status
+    this.provenance = provenance
   }
+}
+
+/** What identifies a credential WITHOUT exposing the token (issue #316). */
+export interface WorkBuddyCredentialProvenance {
+  /** Which auth file the credential was read from. */
+  filePath?: string
+  domain?: string
+  expiresAtMs?: number
+  /** Which source recorded it (`dsh`, `desktop`, …). */
+  source?: string
+}
+
+/**
+ * Build the provenance of a credential for an error message.
+ *
+ * One line, no token, no refresh token, no uid in full: a `uid`/`uin` is a
+ * phone number on the CN side and belongs in no error string a user pastes into
+ * a public issue. The FILE NAME is the thing that identifies which of several
+ * copies was used, which is the question #316 could not answer.
+ */
+export function provenanceOf(credential: {
+  filePath?: string
+  domain?: string
+  expiresAtMs?: number
+  source?: string
+}): WorkBuddyCredentialProvenance {
+  return {
+    ...credential.filePath === undefined ? {} : { filePath: credential.filePath },
+    ...credential.domain === undefined ? {} : { domain: credential.domain },
+    ...credential.expiresAtMs === undefined ? {} : { expiresAtMs: credential.expiresAtMs },
+    ...credential.source === undefined ? {} : { source: credential.source },
+  }
+}
+
+/**
+ * `file <path> (domain …, expires …, source …)` — the one-line form used both in
+ * the credential-rejected message and in the chat failure text (issue #316).
+ *
+ * Exported so the two surfaces cannot describe the same credential differently.
+ */
+export function describeProvenance(provenance: WorkBuddyCredentialProvenance): string {
+  const parts: string[] = []
+  if (provenance.domain !== undefined && provenance.domain !== '') parts.push(`domain ${provenance.domain}`)
+  if (provenance.expiresAtMs !== undefined) {
+    parts.push(`expires ${new Date(provenance.expiresAtMs).toISOString()}`)
+  }
+  if (provenance.source !== undefined && provenance.source !== '') parts.push(`source ${provenance.source}`)
+  const where = provenance.filePath === undefined || provenance.filePath === ''
+    ? 'an unknown file'
+    : `file ${provenance.filePath}`
+  return parts.length === 0 ? where : `${where} (${parts.join(', ')})`
 }
 
 /** Whether an error reports that the upstream refused the credential itself. */
@@ -4995,14 +5261,17 @@ export function isCredentialRejectedError(value: unknown): value is WorkBuddyCre
     && (value as { code?: unknown }).code === CREDENTIAL_REJECTED_CODE
 }
 
-async function readEnvelope(response: Response): Promise<Envelope> {
+async function readEnvelope(
+  response: Response,
+  provenance?: WorkBuddyCredentialProvenance,
+): Promise<Envelope> {
   const text = await response.text()
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch {
     if (isGatewayAuthRejection(response.status, text)) {
-      throw new WorkBuddyCredentialRejectedError(response.status)
+      throw new WorkBuddyCredentialRejectedError(response.status, provenance)
     }
     throw new Error(`workbuddy upstream returned non-JSON (http ${response.status}): ${text.slice(0, 160)}`)
   }
@@ -5055,12 +5324,28 @@ export class WorkBuddyUpstreamError extends Error {
   readonly status: number
   /** The upstream's own words, untruncated. */
   readonly body: string
+  /**
+   * Which credential the request used (issue #316).
+   *
+   * Carried on this class too, not only on the credential-rejected one: a
+   * GATEWAY edge refusal reaches the user through this path (kind
+   * `gateway_auth`), and the reporter who needed the provenance got a plain
+   * `client` error instead — the diagnostic existed but only on a class that
+   * path never constructs.
+   */
+  readonly provenance: WorkBuddyCredentialProvenance | undefined
 
-  constructor(status: number, body: string, summary: string) {
+  constructor(
+    status: number,
+    body: string,
+    summary: string,
+    provenance?: WorkBuddyCredentialProvenance,
+  ) {
     super(summary)
     this.name = 'WorkBuddyUpstreamError'
     this.status = status
     this.body = body
+    this.provenance = provenance
   }
 }
 
@@ -5096,13 +5381,18 @@ export function upstreamBodyOf(error: unknown): string {
  * written to read: the code, and the same `msg` wording it saw before. Strictly
  * more information than the text-only call, never less.
  */
-function envelopeError(status: number, envelope: Envelope): Error {
-  if (status === 401 || status === 403) return new WorkBuddyCredentialRejectedError(status)
+function envelopeError(
+  status: number,
+  envelope: Envelope,
+  provenance?: WorkBuddyCredentialProvenance,
+): Error {
+  if (status === 401 || status === 403) return new WorkBuddyCredentialRejectedError(status, provenance)
   const kind = classifyUpstreamError(status, `{"code":${envelope.code},"msg":${JSON.stringify(envelope.msg)}}`)
   return new WorkBuddyUpstreamError(
     status,
     envelope.msg,
     `workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`,
+    provenance,
   )
 }
 
@@ -5710,6 +6000,7 @@ export class WorkBuddyUpstreamClient {
       kind,
       message: text,
       detail: parseUpstreamErrorDetail(text),
+      provenance: provenanceOf(credential),
     }
   }
 
@@ -5791,8 +6082,8 @@ export class WorkBuddyUpstreamClient {
       headers: refreshHeaders(credential),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const data = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}
@@ -5881,8 +6172,8 @@ export class WorkBuddyUpstreamClient {
           },
           signal: timeout,
         })
-        const envelope = await readEnvelope(response)
-        if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+        const envelope = await readEnvelope(response, provenanceOf(credential))
+        if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
         const data = typeof envelope.data === 'object' && envelope.data !== null
           ? envelope.data as Record<string, unknown>
           : {}
@@ -5948,8 +6239,8 @@ export class WorkBuddyUpstreamClient {
         },
         signal: timeout,
       })
-      const envelope = await readEnvelope(response)
-      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+      const envelope = await readEnvelope(response, provenanceOf(credential))
+      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
       const data = typeof envelope.data === 'object' && envelope.data !== null
         ? envelope.data as Record<string, unknown>
         : {}
@@ -6009,8 +6300,8 @@ export class WorkBuddyUpstreamClient {
         body: JSON.stringify({ models: batch }),
         signal: signal ?? AbortSignal.timeout(MODEL_BUSY_TIMEOUT_MS),
       })
-      const envelope = await readEnvelope(response)
-      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+      const envelope = await readEnvelope(response, provenanceOf(credential))
+      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
       for (const [id, level] of parseBusyLevels(envelope.data)) levels.set(id, level)
     }
     return levels
@@ -6069,8 +6360,8 @@ export class WorkBuddyUpstreamClient {
         },
         signal: signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS),
       })
-      const envelope = await readEnvelope(response)
-      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+      const envelope = await readEnvelope(response, provenanceOf(credential))
+      if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
       const data = typeof envelope.data === 'object' && envelope.data !== null
         ? envelope.data as Record<string, unknown>
         : {}
@@ -6378,8 +6669,8 @@ export class WorkBuddyUpstreamClient {
       body: '{}',
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const data = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}
@@ -6447,8 +6738,8 @@ export class WorkBuddyUpstreamClient {
       body: '{}',
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const data = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}
@@ -6498,8 +6789,8 @@ export class WorkBuddyUpstreamClient {
       body: '{}',
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
   }
 
   /** Claim today's check-in reward. The browser route guards this mutation. */
@@ -6510,8 +6801,8 @@ export class WorkBuddyUpstreamClient {
       body: '{}',
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const data = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}
@@ -6638,8 +6929,8 @@ export class WorkBuddyUpstreamClient {
       body: JSON.stringify({ tier }),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const data = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}
@@ -6679,8 +6970,8 @@ export class WorkBuddyUpstreamClient {
       body: JSON.stringify({}),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const wrapper = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}
@@ -6769,8 +7060,8 @@ export class WorkBuddyUpstreamClient {
       }),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
-    const envelope = await readEnvelope(response)
-    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const envelope = await readEnvelope(response, provenanceOf(credential))
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope, provenanceOf(credential))
     const responseWrapper = typeof envelope.data === 'object' && envelope.data !== null
       ? envelope.data as Record<string, unknown>
       : {}

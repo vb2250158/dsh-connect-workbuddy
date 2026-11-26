@@ -341,6 +341,16 @@ export interface WorkBuddyUsageCounts {
   promptTokens?: number
   completionTokens?: number
   cachedTokens?: number
+  /**
+   * Credits this turn consumed, as the upstream billed it (issue #320).
+   *
+   * The figure is the upstream's own — `creditOfStream` already reads it for
+   * the probe path, and a user asked to see it per turn instead of only in the
+   * account's running total. Absent means "the stream did not say", which is
+   * reported as nothing rather than as zero: a turn whose cost is unknown must
+   * not look free.
+   */
+  credit?: number
 }
 
 /** A finite, non-negative token count, or undefined for anything else. */
@@ -370,12 +380,42 @@ export function usageOfChunk(chunk: Record<string, unknown>): WorkBuddyUsageCoun
     ? tokenCount((details as Record<string, unknown>)['cached_tokens'])
     : undefined
   const cachedTokens = fromDetails ?? tokenCount(record['prompt_cache_hit_tokens'])
-  if (promptTokens === undefined && completionTokens === undefined && cachedTokens === undefined) return undefined
+  // ONLY `usage.credit`. Review found the first version also read a top-level
+  // `chunk['credit']`, on a guess ("the probe uses a whole-stream regex, so it
+  // cannot say where the figure sat"). Two things kill that guess:
+  //
+  //   1. Every measurement this repo has puts it INSIDE `usage` —
+  //      `docs/IMAGE_GEN.md` reads `data.usage.credit` for the real charge, and
+  //      `tests/probe.spec.ts` asserts `{"usage":{"credit":0}}`. There is no
+  //      sample of a top-level one.
+  //   2. The bare key `credit` means something ELSE on the same upstream: the
+  //      enterprise billing endpoint reports `{credit, limitNum}` where `credit`
+  //      is credits ALREADY USED. Accumulating that as "what this turn cost"
+  //      would produce a number that grows every turn for no reason.
+  //
+  // The fallback was also dead code besides: this function returns early when
+  // there is no `usage` object, so `chunk['credit']` was only ever read on a
+  // chunk that already had a `usage` block — where `usage.credit` wins anyway.
+  const credit = creditCount(record['credit'])
+  if (promptTokens === undefined && completionTokens === undefined && cachedTokens === undefined
+    && credit === undefined) return undefined
   return {
     ...promptTokens === undefined ? {} : { promptTokens },
     ...completionTokens === undefined ? {} : { completionTokens },
     ...cachedTokens === undefined ? {} : { cachedTokens },
+    ...credit === undefined ? {} : { credit },
   }
+}
+
+/**
+ * A finite credit figure, or undefined.
+ *
+ * Non-negative is required because a credit cannot be spent backwards; a
+ * negative value would be a refund or a parse artifact, and either way reporting
+ * it as this turn's cost would be wrong.
+ */
+function creditCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
 /**

@@ -43,6 +43,19 @@ function messagesOf(bodyJson: string): { role: string, content: unknown }[] {
   return (JSON.parse(bodyJson) as { messages: { role: string, content: unknown }[] }).messages
 }
 
+/**
+ * Text with every zero-width break removed.
+ *
+ * The replacement wordings are now ALSO in the prefix list and the identity
+ * clause (issue #321), so `prepareChatBody` gives them a neutral head and breaks
+ * their identity clause at every word boundary — `You \u200bare \u200ban \u200bagent …`.
+ * That IS the behaviour these tests want, so they compare the text the MODEL
+ * reads rather than the exact bytes on the wire. Asserting the raw string here
+ * would pin the pre-#321 defect: a rewritten sentence that got neither
+ * protection.
+ */
+const plain = (text: string): string => text.replace(/\u200b/gu, '')
+
 describe('the sentence-level rewrite table (issue #163)', () => {
   it('removes every measured fingerprint from a DSH-shaped prompt', () => {
     const rewritten = rewriteChannelFingerprintPhrases(DSH_SYSTEM)
@@ -50,9 +63,9 @@ describe('the sentence-level rewrite table (issue #163)', () => {
       expect(rewritten).not.toContain(span)
     }
     // The rewrites are same-meaning; the model still reads the same rules.
-    expect(rewritten).toContain('You are an AI agent running inside DeepSeek Harness.')
+    expect(rewritten).toContain('You are an AI agent running inside the harness.')
     expect(rewritten).toContain('You are a coding agent running on the qmodel_38max model.')
-    expect(rewritten).toContain('You are working with the user inside the DeepSeek Harness Web GUI')
+    expect(rewritten).toContain('You are working with the user inside the harness Web GUI')
     expect(rewritten).toContain('Agent Teams is enabled for this session.')
     expect(rewritten).toContain('Paths that begin with @ are the ones the user explicitly referenced.')
     expect(rewritten).toContain('Relative paths are resolved against the workspace root;')
@@ -90,7 +103,7 @@ describe('the rewrite is wired into prepareChatBody in the required order', () =
     const messages = messagesOf(body)
     expect(messages[0]?.content).toContain('Paths that begin with @')
     expect(messages[0]?.content).not.toContain('Tokens prefixed with @')
-    expect(messages[2]?.content).toContain('running inside DeepSeek Harness')
+    expect(plain(String(messages[2]?.content))).toContain('running inside the harness')
     // The user's own words and a tool result are not the gate's business.
     expect(messages[1]?.content).toBe(TOKENS)
     expect(messages[3]?.content).toBe(TOKENS)
@@ -110,7 +123,7 @@ describe('the rewrite is wired into prepareChatBody in the required order', () =
       ],
     }))
     const content = messagesOf(body)[0]?.content as { type: string, text: string }[]
-    expect(content[0]?.text).toContain('working with the user inside')
+    expect(plain(content[0]?.text ?? '')).toContain('working with the user inside')
     expect(content[1]?.text).toContain('Paths that begin with @')
     expect(content[1]?.text).not.toContain('Tokens prefixed with @')
   })
@@ -157,5 +170,48 @@ describe('the rewrite is wired into prepareChatBody in the required order', () =
     const messages = messagesOf(body)
     expect(messages[0]?.content).toBe('An ordinary system prompt.')
     expect(messages[1]?.content).toBe('hi')
+  })
+})
+
+/**
+ * ISSUE #319 — the rewrite must clear the BRAND, not just the verb.
+ *
+ * A real 5.31.8 sample: after `prepareChatBody`, a 10,761-char system still
+ * carried two `DeepSeek Harness` tokens, and the gateway refused it anyway
+ * while the plugin's own trace reported "all known fingerprints cleared".
+ *
+ * The two rows that leaked kept the product name in their `to` string
+ * ("running inside DeepSeek Harness", "working with the user inside the
+ * DeepSeek Harness Web GUI"). Neither `IDENTITY_CLAUSE` nor the prefix list
+ * covers the REPLACED wording, so those tokens went out with no protection at
+ * all — the weakest strings on the wire.
+ *
+ * These assertions are about the OUTCOME a reporter can verify — no brand left
+ * on the wire — rather than about one chosen wording, so the `to` strings stay
+ * free to change again without rewriting the test (the same downgrade #167
+ * applied to the second GUI span).
+ */
+describe('issue #319: no product name survives the rewrite', () => {
+  it('leaves no brand token when the rewritten rows are the only source of it', () => {
+    const raw = JSON.stringify({
+      messages: [{
+        role: 'system',
+        content: `${IDENTITY}\nA middle line.\n${GUI}\nThe runtime context names the DeepSeek Harness implementation checkout.`,
+      }],
+    })
+    const system = (JSON.parse(prepareChatBody(raw)) as { messages: { content: string }[] }).messages[0]?.content ?? ''
+    expect(system, 'the brand must not survive the rewrite').not.toContain('DeepSeek Harness')
+    // The sentences are still there, and still say the same thing.
+    expect(plain(system)).toContain('running inside the harness')
+    expect(plain(system)).toContain('inside the harness Web GUI')
+  })
+
+  it('clears the brand in BOTH the identity row and the Web GUI row', () => {
+    // Each row alone, so a regression in one is attributed to that row.
+    for (const opening of [IDENTITY, GUI]) {
+      const raw = JSON.stringify({ messages: [{ role: 'system', content: opening }] })
+      const system = (JSON.parse(prepareChatBody(raw)) as { messages: { content: string }[] }).messages[0]?.content ?? ''
+      expect(system, opening).not.toContain('DeepSeek Harness')
+    }
   })
 })
